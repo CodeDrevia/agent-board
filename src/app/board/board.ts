@@ -18,6 +18,7 @@ import {
 import { isPlatformBrowser } from '@angular/common';
 import { BoardService } from './board.service';
 import { Chat } from '../chat/chat/chat';
+import { SendButton } from '../send-button/send-button';
 import {
   COLUMNS,
   ONLINE_WINDOW_MS,
@@ -33,7 +34,7 @@ const IDENTITY_KEY = 'agent-board.identity';
 
 @Component({
   selector: 'app-board',
-  imports: [Chat],
+  imports: [Chat, SendButton],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './board.html',
   styleUrl: './board.scss',
@@ -204,7 +205,10 @@ export class Board {
 
   private async loadDetails(id: number): Promise<void> {
     try {
-      const [history, files] = await Promise.all([this.board.history(id), this.board.attachments(id)]);
+      const [history, files] = await Promise.all([
+        this.board.history(id),
+        this.board.attachments(id),
+      ]);
       if (this.openTaskId() === id) {
         this.history.set(history);
         this.files.set(files);
@@ -224,12 +228,26 @@ export class Board {
     await this.loadDetails(task.id);
   }
 
-  protected async postComment(task: Task): Promise<void> {
+  /** Post the comment draft; rejects on failure so the send button rolls back. */
+  protected readonly postComment = async (task: Task): Promise<void> => {
     const message = this.commentDraft().trim();
     if (!message) return;
-    await this.safely(() => this.board.comment(task.id, message));
+    await this.board.comment(task.id, message);
     this.commentDraft.set('');
-    await this.loadDetails(task.id);
+    // The comment is saved; a failed history refresh must not roll the button back.
+    await this.loadDetails(task.id).catch(() => undefined);
+  };
+
+  private readonly commentActions = new Map<number, () => Promise<void>>();
+
+  /** A stable per-task action for the comment send button. */
+  protected commentAction(task: Task): () => Promise<void> {
+    let action = this.commentActions.get(task.id);
+    if (!action) {
+      action = () => this.postComment(task);
+      this.commentActions.set(task.id, action);
+    }
+    return action;
   }
 
   protected async retarget(task: Task, event: Event): Promise<void> {
@@ -239,7 +257,8 @@ export class Board {
 
   protected async redate(task: Task, event: Event): Promise<void> {
     const due = (event.target as HTMLInputElement).value || null;
-    if (due !== task.due_date) await this.safely(() => this.board.updateTask(task.id, { due_date: due }));
+    if (due !== task.due_date)
+      await this.safely(() => this.board.updateTask(task.id, { due_date: due }));
   }
 
   protected async uploadFile(task: Task, event: Event): Promise<void> {
@@ -273,32 +292,34 @@ export class Board {
     this.draftPriority.set(Number((event.target as HTMLInputElement).value) || 0);
   }
 
-  /** Submit the new-task form. */
-  protected async submit(): Promise<void> {
+  /**
+   * Submit the new-task form. Rejects on failure so the send button rolls back;
+   * the form closes after the "Posted" hold (see {@link closeForm}).
+   */
+  protected readonly submit = async (): Promise<void> => {
     const title = this.draftTitle().trim();
     if (!title) {
       return;
     }
-    try {
-      await this.board.createTask({
-        title,
-        repo: this.draftRepo().trim() || 'global',
-        body: this.draftBody().trim(),
-        tags: this.draftTags().trim(),
-        priority: Number(this.draftPriority()) || 0,
-        agent: this.identity(),
-        target: this.draftTarget().trim().toLowerCase(),
-        due_date: this.draftDue() || null,
-      });
-    } catch {
-      return;
-    }
+    await this.board.createTask({
+      title,
+      repo: this.draftRepo().trim() || 'global',
+      body: this.draftBody().trim(),
+      tags: this.draftTags().trim(),
+      priority: Number(this.draftPriority()) || 0,
+      agent: this.identity(),
+      target: this.draftTarget().trim().toLowerCase(),
+      due_date: this.draftDue() || null,
+    });
     this.draftTitle.set('');
     this.draftBody.set('');
     this.draftTags.set('');
     this.draftPriority.set(0);
     this.draftTarget.set('');
     this.draftDue.set('');
+  };
+
+  protected closeForm(): void {
     this.formOpen.set(false);
   }
 

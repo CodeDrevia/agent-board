@@ -104,7 +104,7 @@
 }
 
 @if (formOpen()) {
-  <form class="new-task" (submit)="$event.preventDefault(); submit()">
+  <form class="new-task" (submit)="$event.preventDefault()">
     <div class="form-title">
       <strong>New task</strong>
       <span>Define one clear unit of work.</span>
@@ -165,13 +165,15 @@
       </label>
       <div class="form-actions">
         <button class="secondary" type="button" (click)="formOpen.set(false)">Cancel</button>
-        <button
-          class="primary"
+        <app-send-button
           type="submit"
+          label="Post task"
+          doneLabel="Posted"
+          [resetAfter]="900"
+          [action]="submit"
           [disabled]="board.mutationPending() || !draftTitle().trim()"
-        >
-          {{ board.mutationPending() ? 'Posting…' : 'Post task' }}
-        </button>
+          (sent)="closeForm()"
+        />
       </div>
     </div>
   </form>
@@ -277,7 +279,9 @@
                 @if (task.result_links.length) {
                   <ul class="result-links">
                     @for (link of task.result_links; track link) {
-                      <li><a [href]="link" target="_blank" rel="noopener noreferrer">{{ link }}</a></li>
+                      <li>
+                        <a [href]="link" target="_blank" rel="noopener noreferrer">{{ link }}</a>
+                      </li>
                     }
                   </ul>
                 }
@@ -306,23 +310,43 @@
                     <div class="detail-row">
                       <label class="form-field">
                         <span>For</span>
-                        <input [value]="task.target" (change)="retarget(task, $event)" list="target-options" />
+                        <input
+                          [value]="task.target"
+                          (change)="retarget(task, $event)"
+                          list="target-options"
+                        />
                       </label>
                       <label class="form-field">
                         <span>Due</span>
-                        <input type="date" [value]="task.due_date ?? ''" (change)="redate(task, $event)" />
+                        <input
+                          type="date"
+                          [value]="task.due_date ?? ''"
+                          (change)="redate(task, $event)"
+                        />
                       </label>
                     </div>
 
                     <label class="form-field">
                       <span>Result</span>
-                      <textarea rows="3" [value]="resultDraft()" (input)="onTextInput(resultDraft, $event)"></textarea>
+                      <textarea
+                        rows="3"
+                        [value]="resultDraft()"
+                        (input)="onTextInput(resultDraft, $event)"
+                      ></textarea>
                     </label>
                     <label class="form-field">
                       <span>Links (one per line)</span>
-                      <textarea rows="2" [value]="linksDraft()" (input)="onTextInput(linksDraft, $event)"></textarea>
+                      <textarea
+                        rows="2"
+                        [value]="linksDraft()"
+                        (input)="onTextInput(linksDraft, $event)"
+                      ></textarea>
                     </label>
-                    <button type="button" (click)="saveResult(task)" [disabled]="board.mutationPending()">
+                    <button
+                      type="button"
+                      (click)="saveResult(task)"
+                      [disabled]="board.mutationPending()"
+                    >
                       Save result
                     </button>
 
@@ -332,13 +356,19 @@
                         <li>
                           <a [href]="'/api/attachments/' + file.id">{{ file.filename }}</a>
                           <span>{{ size(file.size) }} · {{ file.uploaded_by }}</span>
-                          <button type="button" class="secondary" (click)="deleteFile(task, file)">Delete</button>
+                          <button type="button" class="secondary" (click)="deleteFile(task, file)">
+                            Delete
+                          </button>
                         </li>
                       } @empty {
                         <li class="muted">No files.</li>
                       }
                     </ul>
-                    <input type="file" (change)="uploadFile(task, $event)" aria-label="Attach a file" />
+                    <input
+                      type="file"
+                      (change)="uploadFile(task, $event)"
+                      aria-label="Attach a file"
+                    />
 
                     <h4>Comments and history</h4>
                     <ol class="history">
@@ -354,15 +384,18 @@
                     </ol>
                     <label class="form-field">
                       <span>Comment</span>
-                      <textarea rows="2" [value]="commentDraft()" (input)="onTextInput(commentDraft, $event)"></textarea>
+                      <textarea
+                        rows="2"
+                        [value]="commentDraft()"
+                        (input)="onTextInput(commentDraft, $event)"
+                      ></textarea>
                     </label>
-                    <button
-                      type="button"
-                      (click)="postComment(task)"
+                    <app-send-button
+                      label="Post comment"
+                      doneLabel="Posted"
+                      [action]="commentAction(task)"
                       [disabled]="board.mutationPending() || !commentDraft().trim()"
-                    >
-                      Post comment
-                    </button>
+                    />
                   </div>
                 }
 
