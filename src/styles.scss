@@ -1,0 +1,10 @@
+/* Global reset for the board app. */
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: oklch(0.145 0.008 255);
+}

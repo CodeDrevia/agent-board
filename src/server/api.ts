@@ -1,0 +1,522 @@
+/**
+ * HTTP API for the bulletin board.
+ *
+ * This router is mounted at `/api` by the SSR server (`server.ts`). It is a thin
+ * translation layer over `repo.ts`: parse/validate input, call the data layer,
+ * map results to status codes. Everything speaks JSON.
+ *
+ * Agents (Claude, Codex, or anything that can make an HTTP request) drive the
+ * board entirely through these endpoints; see `AGENTS.md` for the protocol.
+ */
+import { Router, json, type Request, type Response } from 'express';
+import {
+  acknowledgeMessage,
+  claimTask,
+  commentTask,
+  countInbox,
+  createChannel,
+  createTask,
+  deleteTask,
+  getTask,
+  heartbeat,
+  joinChannel,
+  leaveChannel,
+  listActivity,
+  listAgents,
+  listArchivedTasks,
+  listChannels,
+  listRecentlyCompleted,
+  listRepos,
+  listTasks,
+  listMessages,
+  listThreads,
+  pruneMessages,
+  readInbox,
+  recordNote,
+  releaseTask,
+  setStatus,
+  sendMessage,
+  unreadCounts,
+  updateTask,
+  type AgentKind,
+  type TaskStatus,
+} from './repo';
+
+/** Valid task statuses accepted from clients. */
+const STATUSES: readonly TaskStatus[] = [
+  'todo',
+  'claimed',
+  'in_progress',
+  'blocked',
+  'done',
+  'abandoned',
+];
+
+/** Read a query-string boolean (`1`, `true`, or a bare flag) as a boolean. */
+function isTruthy(raw: unknown): boolean {
+  if (raw === undefined || raw === null) return false;
+  const value = String(raw).trim().toLowerCase();
+  return value === '' || value === '1' || value === 'true' || value === 'yes';
+}
+
+/** Parse a route `:id` param into a positive integer, or `null` if invalid. */
+function parseId(raw: string): number | null {
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/** Build the `/api` router with all board endpoints registered. */
+export function createApiRouter(): Router {
+  const api = Router();
+  api.use(json({ limit: '512kb' }));
+
+  /** Liveness probe. */
+  api.get('/health', (_req, res) => {
+    res.json({ ok: true, service: 'agent-board', time: Date.now() });
+  });
+
+  // --- Agents ---------------------------------------------------------------
+
+  /** Register / refresh an agent's presence. */
+  api.post('/agents/heartbeat', (req: Request, res: Response) => {
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+    const kind = req.body?.kind as AgentKind | undefined;
+    const host = req.body?.host ? String(req.body.host) : undefined;
+    res.json(heartbeat({ name, kind, host }));
+  });
+
+  /** List all agents that have ever checked in. */
+  api.get('/agents', (_req, res) => {
+    res.json(listAgents());
+  });
+
+  // --- Tasks ----------------------------------------------------------------
+
+  /** List tasks with optional `repo`, `status`, and `q` (search) filters. */
+  api.get('/tasks', (req: Request, res: Response) => {
+    const status = req.query['status'] as TaskStatus | undefined;
+    if (status && !STATUSES.includes(status)) {
+      res.status(400).json({ error: `invalid status: ${status}` });
+      return;
+    }
+    res.json(
+      listTasks({
+        repo: req.query['repo'] ? String(req.query['repo']) : undefined,
+        status,
+        q: req.query['q'] ? String(req.query['q']) : undefined,
+      }),
+    );
+  });
+
+  /** Distinct repo names on the board (for filter UIs). */
+  api.get('/repos', (_req, res) => {
+    res.json(listRepos());
+  });
+
+  api.get('/tasks/recently-completed', (req, res) => {
+    res.json(
+      listRecentlyCompleted({
+        repo: req.query['repo'] ? String(req.query['repo']) : undefined,
+        limit: req.query['limit'] ? Number(req.query['limit']) : undefined,
+      }),
+    );
+  });
+
+  api.get('/archive', (req, res) => {
+    res.json(
+      listArchivedTasks({
+        repo: req.query['repo'] ? String(req.query['repo']) : undefined,
+        q: req.query['q'] ? String(req.query['q']) : undefined,
+        limit: req.query['limit'] ? Number(req.query['limit']) : undefined,
+      }),
+    );
+  });
+
+  /** Create a new task. `title` is required; everything else has defaults. */
+  api.post('/tasks', (req: Request, res: Response) => {
+    const title = String(req.body?.title ?? '').trim();
+    if (!title) {
+      res.status(400).json({ error: 'title is required' });
+      return;
+    }
+    const task = createTask({
+      repo: req.body?.repo ? String(req.body.repo) : undefined,
+      title,
+      body: req.body?.body ? String(req.body.body) : undefined,
+      tags: req.body?.tags ? String(req.body.tags) : undefined,
+      priority: Number.isFinite(req.body?.priority) ? Number(req.body.priority) : undefined,
+      created_by: req.body?.agent ? String(req.body.agent) : undefined,
+    });
+    res.status(201).json(task);
+  });
+
+  /** Fetch a single task. */
+  api.get('/tasks/:id', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const task = getTask(id);
+    if (!task) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(task);
+  });
+
+  /** Edit task fields (title/body/tags/priority/repo). */
+  api.patch('/tasks/:id', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const task = updateTask(id, {
+      title: req.body?.title !== undefined ? String(req.body.title) : undefined,
+      body: req.body?.body !== undefined ? String(req.body.body) : undefined,
+      tags: req.body?.tags !== undefined ? String(req.body.tags) : undefined,
+      priority: Number.isFinite(req.body?.priority) ? Number(req.body.priority) : undefined,
+      repo: req.body?.repo !== undefined ? String(req.body.repo) : undefined,
+    });
+    if (!task) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(task);
+  });
+
+  /** Delete a task. */
+  api.delete('/tasks/:id', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    res.json({ deleted: deleteTask(id) });
+  });
+
+  /**
+   * Atomically claim a task. Returns 200 on success, 409 with the current
+   * holder if another agent already owns it, 404 if it does not exist.
+   */
+  api.post('/tasks/:id/claim', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const agent = String(req.body?.agent ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const result = claimTask(id, agent);
+    if (result.ok) {
+      res.json(result.task);
+      return;
+    }
+    if (result.reason === 'not_found') {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res
+      .status(409)
+      .json({ error: 'already claimed', claimed_by: result.task.claimed_by, task: result.task });
+  });
+
+  /** Release a claim, returning the task to `todo`. */
+  api.post('/tasks/:id/release', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const agent = String(req.body?.agent ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const result = releaseTask(id, agent);
+    if (!result.ok && result.reason === 'not_found') {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    if (!result.ok) {
+      res.status(409).json({
+        error: 'task is not claimed by this agent',
+        claimed_by: result.task.claimed_by,
+        task: result.task,
+      });
+      return;
+    }
+    res.json(result.task);
+  });
+
+  /** Transition a task to a new status (in_progress, blocked, done, ...). */
+  api.post('/tasks/:id/status', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const status = req.body?.status as TaskStatus;
+    if (!STATUSES.includes(status)) {
+      res.status(400).json({ error: `invalid status: ${status}` });
+      return;
+    }
+    const agent = String(req.body?.agent ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const result = setStatus(
+      id,
+      status,
+      agent,
+      req.body?.message ? String(req.body.message) : undefined,
+    );
+    if (!result.ok && result.reason === 'not_found') {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    if (!result.ok && result.reason === 'conflict') {
+      res.status(409).json({
+        error: 'task is owned by another agent',
+        claimed_by: result.task.claimed_by,
+        task: result.task,
+      });
+      return;
+    }
+    if (!result.ok) {
+      res.status(422).json({
+        error: `cannot move task from ${result.task.status} to ${status}`,
+        task: result.task,
+      });
+      return;
+    }
+    res.json(result.task);
+  });
+
+  /** Post a comment against a task (recorded in the activity feed). */
+  api.post('/tasks/:id/comment', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const agent = String(req.body?.agent ?? '').trim();
+    const message = String(req.body?.message ?? '').trim();
+    if (!agent || !message) {
+      res.status(400).json({ error: 'agent and message are required' });
+      return;
+    }
+    if (!commentTask(id, agent, message)) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.status(201).json({ ok: true });
+  });
+
+  // --- Activity -------------------------------------------------------------
+
+  /** Read the append-only activity feed. */
+  api.get('/activity', (req: Request, res: Response) => {
+    res.json(
+      listActivity({
+        repo: req.query['repo'] ? String(req.query['repo']) : undefined,
+        limit: req.query['limit'] ? Number(req.query['limit']) : undefined,
+      }),
+    );
+  });
+
+  /**
+   * Record a free-form activity note (not tied to a task). Agent hooks post
+   * here to report presence and what they're working on.
+   */
+  api.post('/activity', (req: Request, res: Response) => {
+    const message = String(req.body?.message ?? '').trim();
+    if (!message) {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+    recordNote({
+      agent: req.body?.agent ? String(req.body.agent) : undefined,
+      repo: req.body?.repo ? String(req.body.repo) : undefined,
+      kind: req.body?.kind ? String(req.body.kind) : undefined,
+      message,
+    });
+    res.status(201).json({ ok: true });
+  });
+
+  // --- Channels -------------------------------------------------------------
+
+  /** List all group-chat channels with their membership. */
+  api.get('/channels', (_req, res) => {
+    res.json(listChannels());
+  });
+
+  /** Create a channel. `name` is required; `members` seeds initial membership. */
+  api.post('/channels', (req: Request, res: Response) => {
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+    const members = Array.isArray(req.body?.members)
+      ? req.body.members.map((m: unknown) => String(m))
+      : undefined;
+    const result = createChannel({
+      name,
+      created_by: req.body?.agent ? String(req.body.agent) : undefined,
+      members,
+    });
+    if (!result.ok) {
+      const status = result.reason === 'already_exists' ? 409 : 400;
+      res.status(status).json({ error: result.reason });
+      return;
+    }
+    res.status(201).json(result.channel);
+  });
+
+  /** Join a channel. */
+  api.post('/channels/:id/join', (req: Request, res: Response) => {
+    const agent = String(req.body?.agent ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const channel = joinChannel(String(req.params['id']), agent);
+    if (!channel) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(channel);
+  });
+
+  /** Leave a channel. */
+  api.post('/channels/:id/leave', (req: Request, res: Response) => {
+    const agent = String(req.body?.agent ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const channel = leaveChannel(String(req.params['id']), agent);
+    if (!channel) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(channel);
+  });
+
+  // --- Messages -------------------------------------------------------------
+
+  /**
+   * Read the public transcript of durable agent-to-agent messages, optionally
+   * filtered by free text (`q`), `thread_id`, participant (`agent`), or
+   * `unread=1` for messages still awaiting acknowledgement.
+   */
+  api.get('/messages', (req: Request, res: Response) => {
+    res.json(
+      listMessages({
+        after_id: req.query['after_id'] ? Number(req.query['after_id']) : undefined,
+        limit: req.query['limit'] ? Number(req.query['limit']) : undefined,
+        q: req.query['q'] ? String(req.query['q']) : undefined,
+        thread_id: req.query['thread_id'] ? String(req.query['thread_id']) : undefined,
+        agent: req.query['agent'] ? String(req.query['agent']) : undefined,
+        unread_only: isTruthy(req.query['unread']),
+      }),
+    );
+  });
+
+  /** Conversation threads with message and unread counts, for filter UIs. */
+  api.get('/messages/threads', (req: Request, res: Response) => {
+    res.json(listThreads({ limit: req.query['limit'] ? Number(req.query['limit']) : undefined }));
+  });
+
+  /** Pending message counts per recipient token, for unread badges. */
+  api.get('/messages/unread-counts', (_req, res) => {
+    res.json(unreadCounts());
+  });
+
+  /**
+   * Run one bounded retention sweep. Retention also runs opportunistically on
+   * every send; this endpoint exists for cron jobs and operational cleanup.
+   */
+  api.post('/messages/prune', (req: Request, res: Response) => {
+    const limit = Number.isFinite(req.body?.limit) ? Number(req.body.limit) : undefined;
+    res.json({ deleted: pruneMessages({ limit }) });
+  });
+
+  /** Send a durable direct message from the human chat interface. */
+  api.post('/messages', (req: Request, res: Response) => {
+    const sender = String(req.body?.from ?? '').trim();
+    const recipient = String(req.body?.to ?? '').trim();
+    const body = String(req.body?.message ?? '').trim();
+    if (!sender || !recipient || !body) {
+      res.status(400).json({ error: 'from, to, and message are required' });
+      return;
+    }
+    const result = sendMessage({
+      sender,
+      recipient,
+      body,
+      thread_id: req.body?.thread_id ? String(req.body.thread_id) : undefined,
+    });
+    if (!result.ok) {
+      res.status(404).json({ error: 'recipient is not an active agent or channel' });
+      return;
+    }
+    res.status(201).json(result.message);
+  });
+
+  /**
+   * Read one agent's pending mailbox. This is the pull-based delivery path used
+   * by non-MCP harnesses (the `agentboard` CLI, hooks, plain `curl`).
+   */
+  api.get('/inbox', (req: Request, res: Response) => {
+    const agent = String(req.query['agent'] ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const messages = readInbox({
+      agent,
+      after_id: req.query['after_id'] ? Number(req.query['after_id']) : undefined,
+      limit: req.query['limit'] ? Number(req.query['limit']) : undefined,
+      include_acknowledged: isTruthy(req.query['include_acknowledged']),
+    });
+    res.json({
+      agent,
+      messages,
+      pending: countInbox(agent),
+      next_cursor: messages.at(-1)?.id ?? Number(req.query['after_id'] ?? 0),
+    });
+  });
+
+  /** Acknowledge one received message, removing it from that agent's inbox. */
+  api.post('/messages/:id/ack', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const agent = String(req.body?.agent ?? '').trim();
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const message = acknowledgeMessage(id, agent);
+    if (!message) {
+      res.status(404).json({ error: 'no such message for this agent' });
+      return;
+    }
+    res.json(message);
+  });
+
+  return api;
+}
