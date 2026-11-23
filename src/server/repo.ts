@@ -7,6 +7,7 @@
  * agents can never win the same task.
  */
 import { db, now } from './db';
+import { notifyTaskEvent } from './notify';
 
 /** Lifecycle states a task can be in. */
 export type TaskStatus = 'todo' | 'claimed' | 'in_progress' | 'blocked' | 'done' | 'abandoned';
@@ -312,7 +313,8 @@ export function listTasks(query: TaskQuery = {}): Task[] {
       `SELECT * FROM tasks ${where}
        ORDER BY priority DESC, created_at DESC`,
     )
-    .all(params).map(hydrate);
+    .all(params)
+    .map(hydrate);
 }
 
 /** Recently completed work shown briefly outside the active workflow lanes. */
@@ -337,7 +339,8 @@ export function listRecentlyCompleted(
       `SELECT * FROM tasks WHERE ${clauses.join(' AND ')}
        ORDER BY updated_at DESC LIMIT @limit`,
     )
-    .all(params).map(hydrate);
+    .all(params)
+    .map(hydrate);
 }
 
 /** Search completed work once it has aged out of the operational board. */
@@ -369,7 +372,8 @@ export function listArchivedTasks(
       `SELECT * FROM tasks WHERE ${clauses.join(' AND ')}
        ORDER BY updated_at DESC LIMIT @limit`,
     )
-    .all(params).map(hydrate);
+    .all(params)
+    .map(hydrate);
 }
 
 /** Fetch a single task by id, or `undefined` if it does not exist. */
@@ -424,7 +428,9 @@ export function createTask(input: {
     kind: 'created',
     message: input.title,
   });
-  return getTask(id)!;
+  const created = getTask(id)!;
+  notifyTaskEvent('task.created', created);
+  return created;
 }
 
 /** Outcome of a claim attempt. */
@@ -554,7 +560,9 @@ export function setStatus(
 /** Partially update editable fields of a task. */
 export function updateTask(
   id: number,
-  patch: Partial<Pick<Task, 'title' | 'body' | 'tags' | 'priority' | 'repo' | 'target' | 'due_date'>>,
+  patch: Partial<
+    Pick<Task, 'title' | 'body' | 'tags' | 'priority' | 'repo' | 'target' | 'due_date'>
+  >,
 ): Task | undefined {
   const existing = getTask(id);
   if (!existing) {
@@ -580,7 +588,9 @@ export function updateTask(
       repo: patch.repo ?? existing.repo,
       ts,
     });
-  return getTask(id);
+  const updated = getTask(id);
+  if (updated && updated.target !== existing.target) notifyTaskEvent('task.retargeted', updated);
+  return updated;
 }
 
 /** Write a task's result (text + links). Anyone signed in may do it; it is logged. */
@@ -643,8 +653,7 @@ export function addAttachment(input: Omit<Attachment, 'id' | 'created_at'>): Att
 
 export function getAttachment(id: number): Attachment | undefined {
   return db().prepare(`SELECT * FROM attachments WHERE id = ?`).get(id) as unknown as
-    | Attachment
-    | undefined;
+    Attachment | undefined;
 }
 
 export function listAttachments(taskId: number): Attachment[] {
