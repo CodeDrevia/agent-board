@@ -29,6 +29,7 @@ import {
   listComments,
   listTargets,
   parseDueDate,
+  parsePriority,
   parseLinks,
   setResult,
   commentTask,
@@ -181,6 +182,11 @@ export function createApiRouter(): Router {
       return;
     }
     const due = parseDueDate(req.body?.due_date);
+    const parsedPriority = parsePriority(req.body?.priority);
+    if (parsedPriority === 'invalid') {
+      res.status(400).json({ error: 'priority must be an integer or one of low, normal, high, urgent' });
+      return;
+    }
     if (due === 'invalid') {
       res.status(400).json({ error: 'due_date must be YYYY-MM-DD' });
       return;
@@ -192,7 +198,7 @@ export function createApiRouter(): Router {
       title,
       body: req.body?.body ? String(req.body.body) : undefined,
       tags: req.body?.tags ? String(req.body.tags) : undefined,
-      priority: Number.isFinite(req.body?.priority) ? Number(req.body.priority) : undefined,
+      priority: parsedPriority,
       created_by: actorFor(principal(res), req.body?.agent),
     });
     res.status(201).json(task);
@@ -221,6 +227,11 @@ export function createApiRouter(): Router {
       return;
     }
     const due = req.body?.due_date === undefined ? undefined : parseDueDate(req.body.due_date);
+    const parsedPriority = parsePriority(req.body?.priority);
+    if (parsedPriority === 'invalid') {
+      res.status(400).json({ error: 'priority must be an integer or one of low, normal, high, urgent' });
+      return;
+    }
     if (due === 'invalid') {
       res.status(400).json({ error: 'due_date must be YYYY-MM-DD' });
       return;
@@ -231,7 +242,7 @@ export function createApiRouter(): Router {
       title: req.body?.title !== undefined ? String(req.body.title) : undefined,
       body: req.body?.body !== undefined ? String(req.body.body) : undefined,
       tags: req.body?.tags !== undefined ? String(req.body.tags) : undefined,
-      priority: Number.isFinite(req.body?.priority) ? Number(req.body.priority) : undefined,
+      priority: parsedPriority,
       repo: req.body?.repo !== undefined ? String(req.body.repo) : undefined,
     });
     if (!task) {
@@ -450,7 +461,7 @@ export function createApiRouter(): Router {
       id,
       status,
       agent,
-      req.body?.message ? String(req.body.message) : undefined,
+      (req.body?.body ?? req.body?.message) ? String(req.body.body ?? req.body.message) : undefined,
     );
     if (!result.ok && result.reason === 'not_found') {
       res.status(404).json({ error: 'not found' });
@@ -482,7 +493,7 @@ export function createApiRouter(): Router {
       return;
     }
     const agent = actorFor(principal(res), req.body?.agent);
-    const message = String(req.body?.message ?? '').trim();
+    const message = String(req.body?.body ?? req.body?.message ?? '').trim();
     if (!agent || !message) {
       res.status(400).json({ error: 'agent and message are required' });
       return;
@@ -511,7 +522,7 @@ export function createApiRouter(): Router {
    * here to report presence and what they're working on.
    */
   api.post('/activity', (req: Request, res: Response) => {
-    const message = String(req.body?.message ?? '').trim();
+    const message = String(req.body?.body ?? req.body?.message ?? '').trim();
     if (!message) {
       res.status(400).json({ error: 'message is required' });
       return;
@@ -628,7 +639,7 @@ export function createApiRouter(): Router {
   api.post('/messages', (req: Request, res: Response) => {
     const sender = actorFor(principal(res), req.body?.from);
     const recipient = String(req.body?.to ?? '').trim();
-    const body = String(req.body?.message ?? '').trim();
+    const body = String(req.body?.body ?? req.body?.message ?? '').trim();
     if (!sender || !recipient || !body) {
       res.status(400).json({ error: 'from, to, and message are required' });
       return;
