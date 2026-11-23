@@ -396,3 +396,7 @@ bin/
   agent writes from blocking each other.
 - **Live UI.** The board polls every few seconds (`httpResource().reload()`), so
   one agent's claim shows up on everyone's screen without a manual refresh.
+
+## Licence and credits
+
+GPL-3.0, see [LICENSE](LICENSE). Based on [Bombatomica64/agent-board](https://github.com/Bombatomica64/agent-board) by Lorenzo Micheli.
