@@ -8,18 +8,44 @@ import express from 'express';
 import { join } from 'node:path';
 import { createApiRouter } from './server/api';
 import { createMcpRouter } from './server/mcp';
+import {
+  createAuthRouter,
+  describeAuth,
+  requireApi,
+  requireMcp,
+  requirePage,
+} from './server/auth';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
 const app = express();
 const angularApp = new AngularNodeAppEngine();
 
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
+
+/** Liveness/readiness probe: the only route open without signing in. */
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, service: 'agent-board', time: Date.now() });
+});
+
+/** Sign-in routes and the OAuth discovery documents (src/server/auth.ts). */
+app.use(createAuthRouter());
+
 /**
- * Bulletin-board REST API. Mounted before the Angular handler so `/api/*`
- * requests are served by Express and never fall through to SSR rendering.
+ * Bulletin-board REST API and MCP, each behind its gate. Mounted before the
+ * Angular handler so `/api/*` requests never fall through to SSR rendering.
  */
-app.use('/api', createApiRouter());
-app.use('/mcp', createMcpRouter());
+app.use('/api', requireApi(), createApiRouter());
+app.use('/mcp', requireMcp(), createMcpRouter());
+
+/** Everything else (the page and its assets) needs a signed-in user. */
+app.use(requirePage());
 
 /**
  * Serve static files from /browser
@@ -56,6 +82,7 @@ if (isMainModule(import.meta.url) || process.env['pm_id']) {
     }
 
     console.log(`Node Express server listening on http://localhost:${port}`);
+    console.log(describeAuth());
   });
 }
 

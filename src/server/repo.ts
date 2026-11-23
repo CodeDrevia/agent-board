@@ -28,6 +28,70 @@ export interface Task {
   created_by: string | null;
   created_at: number;
   updated_at: number;
+  /** Who the task is meant for ("orchestrator", "chatgpt", "alessandro"); '' = anyone. */
+  target: string;
+  /** Outcome written by whoever finished it. */
+  result: string;
+  /** Links that go with the result (PRs, docs), http(s) only. */
+  result_links: string[];
+  /** Due date as YYYY-MM-DD, or null. */
+  due_date: string | null;
+}
+
+/** A file attached to a task; the bytes live on disk under the files directory. */
+export interface Attachment {
+  id: number;
+  task_id: number;
+  filename: string;
+  content_type: string;
+  size: number;
+  stored_name: string;
+  uploaded_by: string | null;
+  created_at: number;
+}
+
+/** Turn a raw `tasks` row (result_links as JSON text) into a {@link Task}. */
+function hydrate(row: unknown): Task {
+  const r = row as Omit<Task, 'result_links'> & { result_links: string | null };
+  let links: string[] = [];
+  try {
+    const parsed = JSON.parse(r.result_links ?? '[]');
+    if (Array.isArray(parsed)) links = parsed.filter((x) => typeof x === 'string');
+  } catch {
+    links = [];
+  }
+  return { ...r, result_links: links };
+}
+
+/** Normalise a target name: trimmed, lower case, at most 64 characters. */
+export function normaliseTarget(raw: string | null | undefined): string {
+  return (raw ?? '').trim().toLowerCase().slice(0, 64);
+}
+
+/** Validate a due date: YYYY-MM-DD for a real calendar day, '' / null clears it. */
+export function parseDueDate(raw: unknown): string | null | 'invalid' {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return 'invalid';
+  const d = new Date(`${raw}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === raw ? raw : 'invalid';
+}
+
+/** Validate result links: at most 20 absolute http(s) URLs. Returns null when any is bad. */
+export function parseLinks(raw: unknown): string[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.length > 20) return null;
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string' || item.length > 2000) return null;
+    try {
+      const u = new URL(item.trim());
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+      out.push(u.toString());
+    } catch {
+      return null;
+    }
+  }
+  return out;
 }
 
 /** An agent process that has checked in with the board. */
@@ -217,6 +281,8 @@ export interface TaskQuery {
   repo?: string;
   status?: TaskStatus;
   q?: string;
+  /** Only tasks for this target; '*' or omitted = all. */
+  target?: string;
 }
 
 /** List tasks, newest first, optionally filtered by repo/status/search. */
@@ -236,13 +302,17 @@ export function listTasks(query: TaskQuery = {}): Task[] {
     clauses.push('(title LIKE @like OR body LIKE @like OR tags LIKE @like)');
     params['like'] = `%${query.q}%`;
   }
+  if (query.target !== undefined && query.target !== '*') {
+    clauses.push('target = @target');
+    params['target'] = normaliseTarget(query.target);
+  }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   return db()
     .prepare(
       `SELECT * FROM tasks ${where}
        ORDER BY priority DESC, created_at DESC`,
     )
-    .all(params) as unknown as Task[];
+    .all(params).map(hydrate);
 }
 
 /** Recently completed work shown briefly outside the active workflow lanes. */
@@ -267,7 +337,7 @@ export function listRecentlyCompleted(
       `SELECT * FROM tasks WHERE ${clauses.join(' AND ')}
        ORDER BY updated_at DESC LIMIT @limit`,
     )
-    .all(params) as unknown as Task[];
+    .all(params).map(hydrate);
 }
 
 /** Search completed work once it has aged out of the operational board. */
@@ -299,12 +369,13 @@ export function listArchivedTasks(
       `SELECT * FROM tasks WHERE ${clauses.join(' AND ')}
        ORDER BY updated_at DESC LIMIT @limit`,
     )
-    .all(params) as unknown as Task[];
+    .all(params).map(hydrate);
 }
 
 /** Fetch a single task by id, or `undefined` if it does not exist. */
 export function getTask(id: number): Task | undefined {
-  return db().prepare(`SELECT * FROM tasks WHERE id = ?`).get(id) as unknown as Task | undefined;
+  const row = db().prepare(`SELECT * FROM tasks WHERE id = ?`).get(id);
+  return row ? hydrate(row) : undefined;
 }
 
 /** Distinct repo names currently represented on the board. */
@@ -323,14 +394,20 @@ export function createTask(input: {
   tags?: string;
   priority?: number;
   created_by?: string;
+  target?: string;
+  due_date?: string | null;
 }): Task {
   const ts = now();
   const result = db()
     .prepare(
-      `INSERT INTO tasks (repo, title, body, status, tags, priority, created_by, created_at, updated_at)
-       VALUES (@repo, @title, @body, 'todo', @tags, @priority, @created_by, @ts, @ts)`,
+      `INSERT INTO tasks (repo, title, body, status, tags, priority, created_by, created_at, updated_at,
+                          target, due_date)
+       VALUES (@repo, @title, @body, 'todo', @tags, @priority, @created_by, @ts, @ts,
+               @target, @due_date)`,
     )
     .run({
+      target: normaliseTarget(input.target),
+      due_date: input.due_date ?? null,
       repo: input.repo?.trim() || 'global',
       title: input.title,
       body: input.body ?? '',
@@ -477,7 +554,7 @@ export function setStatus(
 /** Partially update editable fields of a task. */
 export function updateTask(
   id: number,
-  patch: Partial<Pick<Task, 'title' | 'body' | 'tags' | 'priority' | 'repo'>>,
+  patch: Partial<Pick<Task, 'title' | 'body' | 'tags' | 'priority' | 'repo' | 'target' | 'due_date'>>,
 ): Task | undefined {
   const existing = getTask(id);
   if (!existing) {
@@ -488,11 +565,14 @@ export function updateTask(
     .prepare(
       `UPDATE tasks
          SET title = @title, body = @body, tags = @tags,
-             priority = @priority, repo = @repo, updated_at = @ts
+             priority = @priority, repo = @repo, target = @target,
+             due_date = @due_date, updated_at = @ts
        WHERE id = @id`,
     )
     .run({
       id,
+      target: patch.target !== undefined ? normaliseTarget(patch.target) : existing.target,
+      due_date: patch.due_date !== undefined ? patch.due_date : existing.due_date,
       title: patch.title ?? existing.title,
       body: patch.body ?? existing.body,
       tags: patch.tags ?? existing.tags,
@@ -501,6 +581,98 @@ export function updateTask(
       ts,
     });
   return getTask(id);
+}
+
+/** Write a task's result (text + links). Anyone signed in may do it; it is logged. */
+export function setResult(
+  id: number,
+  input: { result: string; links: string[]; agent?: string },
+): Task | undefined {
+  const existing = getTask(id);
+  if (!existing) return undefined;
+  db()
+    .prepare(`UPDATE tasks SET result = ?, result_links = ?, updated_at = ? WHERE id = ?`)
+    .run(input.result, JSON.stringify(input.links), now(), id);
+  logActivity({
+    task_id: id,
+    agent: input.agent,
+    repo: existing.repo,
+    kind: 'result',
+    message: input.result.slice(0, 500),
+  });
+  return getTask(id);
+}
+
+/** Comments posted on one task, oldest first. */
+export function listComments(taskId: number): Activity[] {
+  return db()
+    .prepare(
+      `SELECT * FROM activity WHERE task_id = ? AND kind IN ('comment', 'result', 'status', 'attachment')
+       ORDER BY created_at ASC, id ASC`,
+    )
+    .all(taskId) as unknown as Activity[];
+}
+
+/** Record an uploaded file (already written to disk as `stored_name`). */
+export function addAttachment(input: Omit<Attachment, 'id' | 'created_at'>): Attachment {
+  const ts = now();
+  const r = db()
+    .prepare(
+      `INSERT INTO attachments (task_id, filename, content_type, size, stored_name, uploaded_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.task_id,
+      input.filename,
+      input.content_type,
+      input.size,
+      input.stored_name,
+      input.uploaded_by ?? null,
+      ts,
+    );
+  const task = getTask(input.task_id);
+  logActivity({
+    task_id: input.task_id,
+    agent: input.uploaded_by,
+    repo: task?.repo,
+    kind: 'attachment',
+    message: input.filename,
+  });
+  return getAttachment(Number(r.lastInsertRowid))!;
+}
+
+export function getAttachment(id: number): Attachment | undefined {
+  return db().prepare(`SELECT * FROM attachments WHERE id = ?`).get(id) as unknown as
+    | Attachment
+    | undefined;
+}
+
+export function listAttachments(taskId: number): Attachment[] {
+  return db()
+    .prepare(`SELECT * FROM attachments WHERE task_id = ? ORDER BY id`)
+    .all(taskId) as unknown as Attachment[];
+}
+
+/** Stored file names of a task's attachments (to remove from disk with the task). */
+export function attachmentFilesOf(taskId: number): string[] {
+  return listAttachments(taskId).map((a) => a.stored_name);
+}
+
+/** Delete one attachment row; returns it so the caller can remove the file. */
+export function deleteAttachment(id: number): Attachment | undefined {
+  const existing = getAttachment(id);
+  if (!existing) return undefined;
+  db().prepare(`DELETE FROM attachments WHERE id = ?`).run(id);
+  return existing;
+}
+
+/** Distinct non-empty targets, for filter UIs. */
+export function listTargets(): string[] {
+  return (
+    db()
+      .prepare(`SELECT DISTINCT target FROM tasks WHERE target != '' ORDER BY target`)
+      .all() as unknown as { target: string }[]
+  ).map((r) => r.target);
 }
 
 /** Delete a task and its activity (via ON DELETE CASCADE). */

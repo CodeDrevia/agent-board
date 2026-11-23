@@ -64,6 +64,44 @@ npm start               # ng serve with SSR + API on http://localhost:4200
 `localhost` and `127.0.0.1` are allowed out of the box. If you reach the board
 by another hostname (a LAN IP, a machine name), add it via `NG_ALLOWED_HOSTS`.
 
+## Shared task queue (DRV-550)
+
+Every task can carry, on top of status and priority:
+
+| Field | Meaning |
+| --- | --- |
+| `target` | Who it is for: `orchestrator`, `chatgpt`, `alessandro`, `lorenzo`… (`''` = anyone). Anyone may still read and claim any task. |
+| `due_date` | `YYYY-MM-DD` |
+| `result`, `result_links` | The outcome, plus up to 20 http(s) links (PRs, docs) |
+| attachments | Files stored on the data volume (`AGENT_BOARD_FILES_DIR`, default `files/` next to the DB), max `AGENT_BOARD_MAX_UPLOAD_BYTES` (10 MiB) |
+
+REST: `GET /tasks?target=chatgpt`, `GET /targets`, `GET /me`, `POST /tasks/:id/result {result, links}`,
+`GET /tasks/:id/comments`, `GET|POST /tasks/:id/attachments` (raw body, `?filename=`),
+`GET|DELETE /attachments/:id`. MCP adds `update_task`, `set_task_result`, `list_targets`,
+`add_attachment` (base64), `read_attachment`; `list_tasks` and `post_task` take `target`, and
+`get_task` returns attachments and comments.
+
+## Authentication
+
+Sign-in is **on by default and fails closed**: with nothing configured, only `/api/health`
+answers; everything else is 401 or a redirect to a sign-in page that says it is not configured.
+Access is for members of one Drevia ID (Authentik) group, `board-users` by default.
+
+| Env var | Meaning |
+| --- | --- |
+| `PUBLIC_BASE_URL` | e.g. `https://board.bombatomica64.dev` (callback, cookies, MCP host allow-list) |
+| `AGENT_BOARD_REQUIRED_GROUP` | Group whose members get in (`board-users`) |
+| `AGENT_BOARD_WEB_ISSUER`, `AGENT_BOARD_WEB_CLIENT_ID`, `AGENT_BOARD_WEB_CLIENT_SECRET` | Web sign-in (OIDC code flow + PKCE, scopes `openid profile offline_access`) |
+| `SESSION_KEY` | 32+ characters; signs the sign-in cookie and encrypts refresh tokens |
+| `AGENT_BOARD_OAUTH_ISSUER`, `AGENT_BOARD_OAUTH_CLIENT_ID` | ChatGPT connector: access tokens for this client with scope `AGENT_BOARD_OAUTH_SCOPE` (`agent-board`) and the group in `groups` |
+| `AGENT_BOARD_API_TOKEN` | Static bearer (32+ chars) for the orchestrator, the CLI and the hook (`AGENT_BOARD_TOKEN` on the client side); acts as `AGENT_BOARD_API_TOKEN_NAME` (`orchestrator`) unless an `agent` is named |
+| `AGENT_BOARD_AUTH=off` | Local development only: no sign-in at all |
+
+Web users and ChatGPT always act as their Drevia ID username, whatever `agent` they pass.
+Sessions are re-checked at Drevia ID every 10 minutes, so removing someone from the group
+locks them out within minutes. Browser writes need the `XSRF-TOKEN` cookie echoed in
+`X-XSRF-TOKEN` (Angular does this). Attachments are always downloaded, never rendered.
+
 ## How agents use it
 
 Every agent gets an **identity** and talks to the board through the `agentboard`

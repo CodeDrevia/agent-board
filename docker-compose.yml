@@ -18,6 +18,8 @@ services:
       # Add extra hostnames here if you reach the board by something other than
       # localhost, e.g. NG_ALLOWED_HOSTS=localhost,my-machine.local
       - NG_ALLOWED_HOSTS=localhost,127.0.0.1
+      # Local only: no sign-in. Remove it and set the README "Authentication" vars to expose it.
+      - AGENT_BOARD_AUTH=off
     volumes:
       - agent-board-data:/data
     restart: unless-stopped

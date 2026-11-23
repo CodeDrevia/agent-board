@@ -18,7 +18,15 @@ import {
 import { isPlatformBrowser } from '@angular/common';
 import { BoardService } from './board.service';
 import { Chat } from '../chat/chat/chat';
-import { COLUMNS, ONLINE_WINDOW_MS, type Agent, type Task, type TaskStatus } from './models';
+import {
+  COLUMNS,
+  ONLINE_WINDOW_MS,
+  type Agent,
+  type Attachment,
+  type Task,
+  type TaskEvent,
+  type TaskStatus,
+} from './models';
 
 /** localStorage key under which the chosen board identity is remembered. */
 const IDENTITY_KEY = 'agent-board.identity';
@@ -45,6 +53,22 @@ export class Board {
   protected readonly draftBody = signal('');
   protected readonly draftTags = signal('');
   protected readonly draftPriority = signal(0);
+  protected readonly draftTarget = signal('');
+  protected readonly draftDue = signal('');
+
+  /** The task whose details panel is open, with its loaded history and files. */
+  protected readonly openTaskId = signal<number | null>(null);
+  protected readonly history = signal<TaskEvent[]>([]);
+  protected readonly files = signal<Attachment[]>([]);
+  protected readonly resultDraft = signal('');
+  protected readonly linksDraft = signal('');
+  protected readonly commentDraft = signal('');
+
+  /** Signed-in name, when the server knows one (web sign-in). */
+  protected readonly signedInAs = computed(() => {
+    const me = this.board.me.hasValue() ? this.board.me.value() : undefined;
+    return me && me.kind === 'web' ? me.name : null;
+  });
   protected readonly formOpen = signal(false);
   protected readonly archiveOpen = signal(false);
   protected readonly chatOpen = signal(false);
@@ -152,6 +176,99 @@ export class Board {
     target.set(value);
   }
 
+  protected onTargetFilterChange(event: Event): void {
+    const v = (event.target as HTMLSelectElement).value;
+    this.board.targetFilter.set(v === '*' ? null : v);
+  }
+
+  protected onTextInput(target: { set(v: string): void }, event: Event): void {
+    target.set((event.target as HTMLInputElement | HTMLTextAreaElement).value);
+  }
+
+  /** True when a due date is today or past and the task is still open. */
+  protected overdue(task: Task): boolean {
+    return !!task.due_date && task.due_date <= new Date().toISOString().slice(0, 10);
+  }
+
+  protected async toggleDetails(task: Task): Promise<void> {
+    if (this.openTaskId() === task.id) {
+      this.openTaskId.set(null);
+      return;
+    }
+    this.openTaskId.set(task.id);
+    this.resultDraft.set(task.result);
+    this.linksDraft.set(task.result_links.join('\n'));
+    this.commentDraft.set('');
+    await this.loadDetails(task.id);
+  }
+
+  private async loadDetails(id: number): Promise<void> {
+    try {
+      const [history, files] = await Promise.all([this.board.history(id), this.board.attachments(id)]);
+      if (this.openTaskId() === id) {
+        this.history.set(history);
+        this.files.set(files);
+      }
+    } catch {
+      this.history.set([]);
+      this.files.set([]);
+    }
+  }
+
+  protected async saveResult(task: Task): Promise<void> {
+    const links = this.linksDraft()
+      .split(/\s+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    await this.safely(() => this.board.setResult(task.id, this.resultDraft(), links));
+    await this.loadDetails(task.id);
+  }
+
+  protected async postComment(task: Task): Promise<void> {
+    const message = this.commentDraft().trim();
+    if (!message) return;
+    await this.safely(() => this.board.comment(task.id, message));
+    this.commentDraft.set('');
+    await this.loadDetails(task.id);
+  }
+
+  protected async retarget(task: Task, event: Event): Promise<void> {
+    const target = (event.target as HTMLInputElement).value.trim().toLowerCase();
+    if (target !== task.target) await this.safely(() => this.board.updateTask(task.id, { target }));
+  }
+
+  protected async redate(task: Task, event: Event): Promise<void> {
+    const due = (event.target as HTMLInputElement).value || null;
+    if (due !== task.due_date) await this.safely(() => this.board.updateTask(task.id, { due_date: due }));
+  }
+
+  protected async uploadFile(task: Task, event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    await this.safely(() => this.board.upload(task.id, file));
+    input.value = '';
+    await this.loadDetails(task.id);
+  }
+
+  protected async deleteFile(task: Task, file: Attachment): Promise<void> {
+    if (!this.isBrowser || confirm(`Delete ${file.filename}?`)) {
+      await this.safely(() => this.board.removeAttachment(file.id));
+      await this.loadDetails(task.id);
+    }
+  }
+
+  protected size(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  protected async logout(): Promise<void> {
+    await this.safely(() => this.board.logout());
+    if (this.isBrowser) location.href = '/';
+  }
+
   protected onPriorityInput(event: Event): void {
     this.draftPriority.set(Number((event.target as HTMLInputElement).value) || 0);
   }
@@ -170,6 +287,8 @@ export class Board {
         tags: this.draftTags().trim(),
         priority: Number(this.draftPriority()) || 0,
         agent: this.identity(),
+        target: this.draftTarget().trim().toLowerCase(),
+        due_date: this.draftDue() || null,
       });
     } catch {
       return;
@@ -178,6 +297,8 @@ export class Board {
     this.draftBody.set('');
     this.draftTags.set('');
     this.draftPriority.set(0);
+    this.draftTarget.set('');
+    this.draftDue.set('');
     this.formOpen.set(false);
   }
 
