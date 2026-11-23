@@ -44,6 +44,11 @@ app.use(createAuthRouter());
 app.use('/api', requireApi(), createApiRouter());
 app.use('/mcp', requireMcp(), createMcpRouter());
 
+/** The favicon is not private: serve it before the sign-in gate so the login page has it too. */
+app.get('/favicon.svg', (_req, res) => {
+  res.sendFile(join(browserDistFolder, 'favicon.svg'), { maxAge: '1d' });
+});
+
 /** Everything else (the page and its assets) needs a signed-in user. */
 app.use(requirePage());
 
