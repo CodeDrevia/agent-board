@@ -55,7 +55,11 @@ async function request(method, path, body) {
   try {
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: body ? { 'content-type': 'application/json' } : undefined,
+      headers: {
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      // AGENT_BOARD_TOKEN: the board's static API token when sign-in is on.
+      ...(process.env.AGENT_BOARD_TOKEN ? { authorization: `Bearer ${process.env.AGENT_BOARD_TOKEN}` } : {}),
+    },
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });

@@ -3,15 +3,23 @@
     <span class="brand-mark" aria-hidden="true">AB</span>
     <div class="brand-copy">
       <h1>Agent Board</h1>
-      <span>Local coordination</span>
+      <span>Shared task queue</span>
     </div>
   </div>
 
   <div class="header-actions">
-    <label class="identity" title="Board actions are attributed to this identity">
-      <span>Acting as</span>
-      <input [value]="identity()" (input)="onIdentityInput($event)" placeholder="human" />
-    </label>
+    @if (signedInAs(); as name) {
+      <span class="identity" title="Board actions are recorded under your Drevia ID name">
+        <span>Signed in as</span>
+        <strong>{{ name }}</strong>
+        <button class="secondary" type="button" (click)="logout()">Sign out</button>
+      </span>
+    } @else {
+      <label class="identity" title="Board actions are attributed to this identity">
+        <span>Acting as</span>
+        <input [value]="identity()" (input)="onIdentityInput($event)" placeholder="human" />
+      </label>
+    }
     <button
       class="refresh-button"
       type="button"
@@ -69,6 +77,16 @@
     </label>
     <span class="filter-divider" aria-hidden="true"></span>
     <label class="repo-filter">
+      <span>For</span>
+      <select [value]="board.targetFilter() ?? '*'" (change)="onTargetFilterChange($event)">
+        <option value="*">Everyone</option>
+        <option value="">Unassigned</option>
+        @for (t of board.targets.value(); track t) {
+          <option [value]="t">{{ t }}</option>
+        }
+      </select>
+    </label>
+    <label class="repo-filter">
       <span>Repository</span>
       <select [value]="board.repoFilter() ?? ''" (change)="onRepoFilterChange($event)">
         <option value="">All repositories</option>
@@ -113,6 +131,24 @@
           (input)="onDraftInput('tags', $event)"
           placeholder="api, bug"
         />
+      </label>
+      <label class="form-field">
+        <span>For</span>
+        <input
+          [value]="draftTarget()"
+          (input)="onTextInput(draftTarget, $event)"
+          placeholder="orchestrator, chatgpt, alessandro…"
+          list="target-options"
+        />
+        <datalist id="target-options">
+          @for (t of board.targets.value(); track t) {
+            <option [value]="t"></option>
+          }
+        </datalist>
+      </label>
+      <label class="form-field">
+        <span>Due</span>
+        <input type="date" [value]="draftDue()" (input)="onTextInput(draftDue, $event)" />
       </label>
       <label class="form-field priority-field">
         <span>Priority</span>
@@ -212,6 +248,14 @@
                   @if (task.priority) {
                     <span class="priority">P{{ task.priority }}</span>
                   }
+                  @if (task.target) {
+                    <span class="target" title="Who this task is for">for {{ task.target }}</span>
+                  }
+                  @if (task.due_date) {
+                    <span class="due" [class.overdue]="overdue(task)" title="Due date">
+                      due {{ task.due_date }}
+                    </span>
+                  }
                 </div>
 
                 <h3>{{ task.title }}</h3>
@@ -227,6 +271,17 @@
                   </div>
                 }
 
+                @if (task.result) {
+                  <p class="task-result"><strong>Result:</strong> {{ task.result }}</p>
+                }
+                @if (task.result_links.length) {
+                  <ul class="result-links">
+                    @for (link of task.result_links; track link) {
+                      <li><a [href]="link" target="_blank" rel="noopener noreferrer">{{ link }}</a></li>
+                    }
+                  </ul>
+                }
+
                 <div class="ownership" [class.unowned]="!task.claimed_by">
                   <span class="owner-dot" aria-hidden="true"></span>
                   @if (task.claimed_by) {
@@ -236,6 +291,80 @@
                     <span>Available to claim</span>
                   }
                 </div>
+
+                <button
+                  type="button"
+                  class="secondary details-toggle"
+                  (click)="toggleDetails(task)"
+                  [attr.aria-expanded]="openTaskId() === task.id"
+                >
+                  {{ openTaskId() === task.id ? 'Hide details' : 'Details, result, files' }}
+                </button>
+
+                @if (openTaskId() === task.id) {
+                  <div class="task-details">
+                    <div class="detail-row">
+                      <label class="form-field">
+                        <span>For</span>
+                        <input [value]="task.target" (change)="retarget(task, $event)" list="target-options" />
+                      </label>
+                      <label class="form-field">
+                        <span>Due</span>
+                        <input type="date" [value]="task.due_date ?? ''" (change)="redate(task, $event)" />
+                      </label>
+                    </div>
+
+                    <label class="form-field">
+                      <span>Result</span>
+                      <textarea rows="3" [value]="resultDraft()" (input)="onTextInput(resultDraft, $event)"></textarea>
+                    </label>
+                    <label class="form-field">
+                      <span>Links (one per line)</span>
+                      <textarea rows="2" [value]="linksDraft()" (input)="onTextInput(linksDraft, $event)"></textarea>
+                    </label>
+                    <button type="button" (click)="saveResult(task)" [disabled]="board.mutationPending()">
+                      Save result
+                    </button>
+
+                    <h4>Files</h4>
+                    <ul class="files">
+                      @for (file of files(); track file.id) {
+                        <li>
+                          <a [href]="'/api/attachments/' + file.id">{{ file.filename }}</a>
+                          <span>{{ size(file.size) }} · {{ file.uploaded_by }}</span>
+                          <button type="button" class="secondary" (click)="deleteFile(task, file)">Delete</button>
+                        </li>
+                      } @empty {
+                        <li class="muted">No files.</li>
+                      }
+                    </ul>
+                    <input type="file" (change)="uploadFile(task, $event)" aria-label="Attach a file" />
+
+                    <h4>Comments and history</h4>
+                    <ol class="history">
+                      @for (event of history(); track event.id) {
+                        <li [attr.data-kind]="event.kind">
+                          <strong>{{ event.agent ?? 'someone' }}</strong>
+                          <span class="muted">{{ event.kind }} · {{ ago(event.created_at) }}</span>
+                          <p>{{ event.message }}</p>
+                        </li>
+                      } @empty {
+                        <li class="muted">Nothing yet.</li>
+                      }
+                    </ol>
+                    <label class="form-field">
+                      <span>Comment</span>
+                      <textarea rows="2" [value]="commentDraft()" (input)="onTextInput(commentDraft, $event)"></textarea>
+                    </label>
+                    <button
+                      type="button"
+                      (click)="postComment(task)"
+                      [disabled]="board.mutationPending() || !commentDraft().trim()"
+                    >
+                      Post comment
+                    </button>
+                  </div>
+                }
 
                 <div class="task-actions">
                   <div class="primary-actions">

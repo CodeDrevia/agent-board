@@ -8,10 +8,29 @@
  * Agents (Claude, Codex, or anything that can make an HTTP request) drive the
  * board entirely through these endpoints; see `AGENTS.md` for the protocol.
  */
-import { Router, json, type Request, type Response } from 'express';
+import { Router, json, raw, type Request, type Response } from 'express';
+import { actorFor, principal } from './auth';
+import {
+  cleanContentType,
+  cleanFilename,
+  maxUploadBytes,
+  readStoredFile,
+  removeStoredFile,
+  storeFile,
+} from './files';
 import {
   acknowledgeMessage,
+  addAttachment,
+  attachmentFilesOf,
   claimTask,
+  deleteAttachment,
+  getAttachment,
+  listAttachments,
+  listComments,
+  listTargets,
+  parseDueDate,
+  parseLinks,
+  setResult,
   commentTask,
   countInbox,
   createChannel,
@@ -68,7 +87,13 @@ function parseId(raw: string): number | null {
 /** Build the `/api` router with all board endpoints registered. */
 export function createApiRouter(): Router {
   const api = Router();
-  api.use(json({ limit: '512kb' }));
+  const parseJson = json({ limit: '512kb' });
+  // Uploads carry raw bytes, whatever their Content-Type: never parse them as JSON.
+  api.use((req, res, next) =>
+    req.method === 'POST' && /^\/tasks\/\d+\/attachments$/.test(req.path)
+      ? next()
+      : parseJson(req, res, next),
+  );
 
   /** Liveness probe. */
   api.get('/health', (_req, res) => {
@@ -108,8 +133,20 @@ export function createApiRouter(): Router {
         repo: req.query['repo'] ? String(req.query['repo']) : undefined,
         status,
         q: req.query['q'] ? String(req.query['q']) : undefined,
+        target: req.query['target'] !== undefined ? String(req.query['target']) : undefined,
       }),
     );
+  });
+
+  /** Who is signed in (the web page shows it and acts as this name). */
+  api.get('/me', (_req, res) => {
+    const p = principal(res);
+    res.json({ name: p.name, kind: p.kind });
+  });
+
+  /** Distinct task targets ("orchestrator", "chatgpt", people), for filter UIs. */
+  api.get('/targets', (_req, res) => {
+    res.json(listTargets());
   });
 
   /** Distinct repo names on the board (for filter UIs). */
@@ -143,13 +180,20 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'title is required' });
       return;
     }
+    const due = parseDueDate(req.body?.due_date);
+    if (due === 'invalid') {
+      res.status(400).json({ error: 'due_date must be YYYY-MM-DD' });
+      return;
+    }
     const task = createTask({
+      target: req.body?.target ? String(req.body.target) : undefined,
+      due_date: due,
       repo: req.body?.repo ? String(req.body.repo) : undefined,
       title,
       body: req.body?.body ? String(req.body.body) : undefined,
       tags: req.body?.tags ? String(req.body.tags) : undefined,
       priority: Number.isFinite(req.body?.priority) ? Number(req.body.priority) : undefined,
-      created_by: req.body?.agent ? String(req.body.agent) : undefined,
+      created_by: actorFor(principal(res), req.body?.agent),
     });
     res.status(201).json(task);
   });
@@ -176,7 +220,14 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'invalid id' });
       return;
     }
+    const due = req.body?.due_date === undefined ? undefined : parseDueDate(req.body.due_date);
+    if (due === 'invalid') {
+      res.status(400).json({ error: 'due_date must be YYYY-MM-DD' });
+      return;
+    }
     const task = updateTask(id, {
+      target: req.body?.target !== undefined ? String(req.body.target) : undefined,
+      due_date: due,
       title: req.body?.title !== undefined ? String(req.body.title) : undefined,
       body: req.body?.body !== undefined ? String(req.body.body) : undefined,
       tags: req.body?.tags !== undefined ? String(req.body.tags) : undefined,
@@ -197,7 +248,128 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'invalid id' });
       return;
     }
-    res.json({ deleted: deleteTask(id) });
+    const files = attachmentFilesOf(id);
+    const deleted = deleteTask(id);
+    if (deleted) files.forEach(removeStoredFile);
+    res.json({ deleted });
+  });
+
+  /** Set a task's result: `{result, links?}`. */
+  api.post('/tasks/:id/result', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    const result = String(req.body?.result ?? '');
+    if (result.length > 16_000) {
+      res.status(400).json({ error: 'result is too long' });
+      return;
+    }
+    const links = parseLinks(req.body?.links);
+    if (links === null) {
+      res.status(400).json({ error: 'links must be up to 20 http(s) URLs' });
+      return;
+    }
+    const task = setResult(id, { result, links, agent: actorFor(principal(res), req.body?.agent) });
+    if (!task) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(task);
+  });
+
+  /** Comments and history of one task, oldest first. */
+  api.get('/tasks/:id/comments', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null || !getTask(id)) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(listComments(id));
+  });
+
+  // --- Attachments ----------------------------------------------------------
+
+  api.get('/tasks/:id/attachments', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    if (id === null || !getTask(id)) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(listAttachments(id));
+  });
+
+  /**
+   * Upload one file as the raw request body. The name comes from `?filename=`,
+   * the type from Content-Type. Larger than the limit: 413.
+   */
+  api.post(
+    '/tasks/:id/attachments',
+    raw({ type: () => true, limit: maxUploadBytes() }),
+    (req: Request, res: Response) => {
+      const id = parseId(String(req.params['id']));
+      if (id === null || !getTask(id)) {
+        res.status(404).json({ error: 'not found' });
+        return;
+      }
+      const body = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        res.status(400).json({ error: 'empty file' });
+        return;
+      }
+      const stored = storeFile(body);
+      try {
+        const attachment = addAttachment({
+          task_id: id,
+          filename: cleanFilename(req.query['filename']),
+          content_type: cleanContentType(req.headers['content-type']),
+          size: body.length,
+          stored_name: stored,
+          uploaded_by: actorFor(principal(res), req.query['agent']),
+        });
+        res.status(201).json(attachment);
+      } catch (error) {
+        removeStoredFile(stored);
+        throw error;
+      }
+    },
+  );
+
+  /** Download: always as an attachment, never rendered in the board's origin. */
+  api.get('/attachments/:id', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    const a = id === null ? undefined : getAttachment(id);
+    if (!a) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    let bytes: Buffer;
+    try {
+      bytes = readStoredFile(a.stored_name);
+    } catch {
+      res.status(410).json({ error: 'file is gone' });
+      return;
+    }
+    res.setHeader('Content-Type', a.content_type);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${a.filename.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(a.filename)}`,
+    );
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(bytes);
+  });
+
+  api.delete('/attachments/:id', (req: Request, res: Response) => {
+    const id = parseId(String(req.params['id']));
+    const a = id === null ? undefined : deleteAttachment(id);
+    if (!a) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    removeStoredFile(a.stored_name);
+    res.json({ deleted: true });
   });
 
   /**
@@ -210,7 +382,7 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'invalid id' });
       return;
     }
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({ error: 'agent is required' });
       return;
@@ -236,7 +408,7 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'invalid id' });
       return;
     }
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({ error: 'agent is required' });
       return;
@@ -269,7 +441,7 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: `invalid status: ${status}` });
       return;
     }
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({ error: 'agent is required' });
       return;
@@ -309,7 +481,7 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'invalid id' });
       return;
     }
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     const message = String(req.body?.message ?? '').trim();
     if (!agent || !message) {
       res.status(400).json({ error: 'agent and message are required' });
@@ -345,7 +517,7 @@ export function createApiRouter(): Router {
       return;
     }
     recordNote({
-      agent: req.body?.agent ? String(req.body.agent) : undefined,
+      agent: actorFor(principal(res), req.body?.agent),
       repo: req.body?.repo ? String(req.body.repo) : undefined,
       kind: req.body?.kind ? String(req.body.kind) : undefined,
       message,
@@ -372,7 +544,7 @@ export function createApiRouter(): Router {
       : undefined;
     const result = createChannel({
       name,
-      created_by: req.body?.agent ? String(req.body.agent) : undefined,
+      created_by: actorFor(principal(res), req.body?.agent),
       members,
     });
     if (!result.ok) {
@@ -385,7 +557,7 @@ export function createApiRouter(): Router {
 
   /** Join a channel. */
   api.post('/channels/:id/join', (req: Request, res: Response) => {
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({ error: 'agent is required' });
       return;
@@ -400,7 +572,7 @@ export function createApiRouter(): Router {
 
   /** Leave a channel. */
   api.post('/channels/:id/leave', (req: Request, res: Response) => {
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({ error: 'agent is required' });
       return;
@@ -454,7 +626,7 @@ export function createApiRouter(): Router {
 
   /** Send a durable direct message from the human chat interface. */
   api.post('/messages', (req: Request, res: Response) => {
-    const sender = String(req.body?.from ?? '').trim();
+    const sender = actorFor(principal(res), req.body?.from);
     const recipient = String(req.body?.to ?? '').trim();
     const body = String(req.body?.message ?? '').trim();
     if (!sender || !recipient || !body) {
@@ -505,7 +677,7 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'invalid id' });
       return;
     }
-    const agent = String(req.body?.agent ?? '').trim();
+    const agent = actorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({ error: 'agent is required' });
       return;

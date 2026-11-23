@@ -3,8 +3,26 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+import { actorFor, publicHostname, type Principal } from './auth';
+import {
+  cleanContentType,
+  cleanFilename,
+  maxUploadBytes,
+  readStoredFile,
+  removeStoredFile,
+  storeFile,
+} from './files';
 import {
   acknowledgeMessage,
+  addAttachment,
+  getAttachment,
+  listAttachments,
+  listComments,
+  listTargets,
+  parseDueDate,
+  parseLinks,
+  setResult,
+  updateTask,
   claimTask,
   commentTask,
   countInbox,
@@ -92,14 +110,22 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'list_tasks',
-    description: 'List tasks visible on the shared Kanban board.',
-    keywords: 'find work backlog todo search board repo status',
+    description:
+      'List open tasks on the shared queue, highest priority first. Filter by target to find work meant for you (e.g. target="chatgpt").',
+    keywords: 'find work backlog todo search board repo status target queue for me assigned',
     shape: {
       repo: z.string().trim().min(1).optional(),
       status: z.enum(TASK_STATUSES).optional(),
       q: z.string().trim().min(1).optional(),
+      target: z
+        .string()
+        .trim()
+        .max(64)
+        .optional()
+        .describe('Only tasks for this target ("orchestrator", "chatgpt", a person); "" = untargeted'),
     },
-    handler: ({ repo, status, q }) => toolResult({ tasks: listTasks({ repo, status, q }) }),
+    handler: ({ repo, status, q, target }) =>
+      toolResult({ tasks: listTasks({ repo, status, q, target }) }),
   }),
 
   defineTool({
@@ -113,22 +139,145 @@ const BOARD_TOOLS: readonly BoardTool[] = [
       tags: z.string().max(1_000).optional(),
       priority: z.number().int().optional(),
       agent: z.string().trim().min(1).optional(),
+      target: z
+        .string()
+        .trim()
+        .max(64)
+        .optional()
+        .describe('Who it is for: "orchestrator", "chatgpt", "alessandro", "lorenzo"; omit for anyone'),
+      due_date: z.string().optional().describe('YYYY-MM-DD'),
     },
-    handler: ({ title, repo, body, tags, priority, agent }) =>
-      toolResult({
-        task: createTask({ title, repo, body, tags, priority, created_by: agent }),
-      }),
+    handler: ({ title, repo, body, tags, priority, agent, target, due_date }) => {
+      const due = parseDueDate(due_date);
+      if (due === 'invalid') return toolError('due_date must be YYYY-MM-DD.');
+      return toolResult({
+        task: createTask({ title, repo, body, tags, priority, created_by: agent, target, due_date: due }),
+      });
+    },
+  }),
+
+  defineTool({
+    name: 'update_task',
+    description: 'Edit a task: title, details, tags, priority, repo, target, or due date.',
+    keywords: 'edit change retarget reassign due deadline priority modify',
+    shape: {
+      task_id: z.number().int().positive(),
+      title: z.string().trim().min(1).max(500).optional(),
+      body: z.string().max(16_000).optional(),
+      tags: z.string().max(1_000).optional(),
+      priority: z.number().int().optional(),
+      repo: z.string().trim().min(1).optional(),
+      target: z.string().trim().max(64).optional(),
+      due_date: z.string().nullable().optional().describe('YYYY-MM-DD, or null to clear'),
+    },
+    handler: ({ task_id, due_date, ...patch }) => {
+      const due = due_date === undefined ? undefined : parseDueDate(due_date);
+      if (due === 'invalid') return toolError('due_date must be YYYY-MM-DD.');
+      const task = updateTask(task_id, { ...patch, due_date: due });
+      return task
+        ? toolResult({ task })
+        : toolError(`Task #${task_id} was not found.`, { reason: 'not_found' });
+    },
+  }),
+
+  defineTool({
+    name: 'set_task_result',
+    description:
+      'Write the outcome of a task (text plus links such as PRs or docs). Replaces any earlier result.',
+    keywords: 'result outcome answer deliver output links report finish',
+    shape: {
+      task_id: z.number().int().positive(),
+      result: z.string().max(16_000),
+      links: z.array(z.string()).max(20).optional().describe('http(s) URLs'),
+      agent: z.string().trim().min(1),
+    },
+    handler: ({ task_id, result, links, agent }) => {
+      const parsed = parseLinks(links);
+      if (parsed === null) return toolError('links must be up to 20 http(s) URLs.');
+      const task = setResult(task_id, { result, links: parsed, agent });
+      return task
+        ? toolResult({ task })
+        : toolError(`Task #${task_id} was not found.`, { reason: 'not_found' });
+    },
+  }),
+
+  defineTool({
+    name: 'list_targets',
+    description: 'List the targets tasks are currently addressed to.',
+    keywords: 'who for recipients assignees queues',
+    shape: {},
+    handler: () => toolResult({ targets: listTargets() }),
+  }),
+
+  defineTool({
+    name: 'add_attachment',
+    description: 'Attach a file to a task (base64 content, size limited).',
+    keywords: 'upload file attach document image',
+    shape: {
+      task_id: z.number().int().positive(),
+      filename: z.string().trim().min(1).max(200),
+      content_base64: z.string().min(1),
+      content_type: z.string().max(100).optional(),
+      agent: z.string().trim().min(1),
+    },
+    handler: ({ task_id, filename, content_base64, content_type, agent }) => {
+      if (!getTask(task_id)) return toolError(`Task #${task_id} was not found.`, { reason: 'not_found' });
+      const bytes = Buffer.from(content_base64, 'base64');
+      if (bytes.length === 0) return toolError('The file is empty or not base64.');
+      if (bytes.length > maxUploadBytes())
+        return toolError(`The file is larger than ${maxUploadBytes()} bytes.`);
+      const stored = storeFile(bytes);
+      try {
+        return toolResult({
+          attachment: addAttachment({
+            task_id,
+            filename: cleanFilename(filename),
+            content_type: cleanContentType(content_type),
+            size: bytes.length,
+            stored_name: stored,
+            uploaded_by: agent,
+          }),
+        });
+      } catch (error) {
+        removeStoredFile(stored);
+        throw error;
+      }
+    },
+  }),
+
+  defineTool({
+    name: 'read_attachment',
+    description: 'Read one attachment of a task; returns its content as base64 (up to 2 MB).',
+    keywords: 'download file open attachment content',
+    shape: { attachment_id: z.number().int().positive() },
+    handler: ({ attachment_id }) => {
+      const a = getAttachment(attachment_id);
+      if (!a) return toolError(`Attachment #${attachment_id} was not found.`, { reason: 'not_found' });
+      if (a.size > 2 * 1024 * 1024)
+        return toolError('This file is too large to return here; open it on the board.', {
+          attachment: a,
+        });
+      try {
+        return toolResult({ attachment: a, content_base64: readStoredFile(a.stored_name).toString('base64') });
+      } catch {
+        return toolError('The file is missing on disk.', { reason: 'gone' });
+      }
+    },
   }),
 
   defineTool({
     name: 'get_task',
-    description: 'Fetch one shared-board task by id.',
+    description: 'Fetch one task by id, with its result, attachments, and comments.',
     keywords: 'read detail single show',
     shape: { task_id: z.number().int().positive() },
     handler: ({ task_id }) => {
       const task = getTask(task_id);
       return task
-        ? toolResult({ task })
+        ? toolResult({
+            task,
+            attachments: listAttachments(task_id),
+            comments: listComments(task_id),
+          })
         : toolError(`Task #${task_id} was not found.`, { reason: 'not_found' });
     },
   }),
@@ -377,11 +526,59 @@ const BOARD_TOOLS: readonly BoardTool[] = [
   }),
 ];
 
+/** Tools whose optional `agent` still means "who is doing this" (creator). */
+const ACTOR_WHEN_OPTIONAL = new Set(['post_task', 'create_channel']);
+
+/** The argument names that carry the acting agent for one tool. */
+function actorKeys(tool: BoardTool): string[] {
+  const keys: string[] = [];
+  for (const key of ['agent', 'from'] as const) {
+    const field = tool.shape[key] as z.ZodTypeAny | undefined;
+    if (field && (!field.isOptional() || ACTOR_WHEN_OPTIONAL.has(tool.name))) keys.push(key);
+  }
+  return keys;
+}
+
+/**
+ * Fill in who is acting. A signed-in user (ChatGPT over OAuth) always acts as
+ * themselves, whatever name they pass; the static token keeps the old behaviour
+ * of naming any agent.
+ */
+function withActor(tool: BoardTool, args: unknown, who: Principal): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...((args as Record<string, unknown>) ?? {}) };
+  for (const key of actorKeys(tool)) out[key] = actorFor(who, out[key]);
+  return out;
+}
+
+/** The advertised schema: actor fields are optional (the server fills them in). */
+function advertisedShape(tool: BoardTool): z.ZodRawShape {
+  const shape: z.ZodRawShape = { ...tool.shape };
+  for (const key of actorKeys(tool)) {
+    shape[key] = (tool.shape[key] as z.ZodTypeAny)
+      .optional()
+      .describe('Acting agent. Ignored for signed-in users, who act as themselves.');
+  }
+  return shape;
+}
+
+async function runTool(tool: BoardTool, args: unknown, who: Principal): Promise<ToolResponse> {
+  const parsed = z.object(tool.shape).safeParse(withActor(tool, args, who));
+  if (!parsed.success) {
+    return toolError(
+      `Invalid arguments for ${tool.name}: ${parsed.error.issues
+        .map((issue) => `${issue.path.join('.') || '(root)'} ${issue.message}`)
+        .join('; ')}`,
+      { reason: 'invalid_arguments', tool: tool.name, inputSchema: inputSchemaOf(tool) },
+    );
+  }
+  return tool.handler(parsed.data as never);
+}
+
 const TOOLS_BY_NAME = new Map(BOARD_TOOLS.map((tool) => [tool.name, tool]));
 const TOOL_NAMES = BOARD_TOOLS.map((tool) => tool.name);
 
 function inputSchemaOf(tool: BoardTool): Record<string, unknown> {
-  return zodToJsonSchema(z.object(tool.shape), {
+  return zodToJsonSchema(z.object(advertisedShape(tool)), {
     target: 'jsonSchema7',
     $refStrategy: 'none',
   }) as Record<string, unknown>;
@@ -404,7 +601,7 @@ const SEARCH_INSTRUCTIONS = [
   'to look one up by intent, then call_tool to run it. Arguments are validated, and an invalid',
   'call returns the tool JSON Schema so you can retry immediately.',
   `Available tools: ${TOOL_NAMES.join(', ')}.`,
-  'Usual flow: heartbeat, list_tasks, post_task, claim_task, set_task_status, comment_task.',
+  'Usual flow: list_tasks (filter by target to find work for you), claim_task, set_task_status, set_task_result, comment_task. Post work for others with post_task and a target.',
   'Mail delivery is pull-based: nothing here can interrupt you, so run read_inbox at session',
   'start and after each meaningful work boundary, then acknowledge_message what you handled.',
 ].join(' ');
@@ -423,21 +620,21 @@ export function defaultToolMode(): McpToolMode {
   return process.env['AGENT_BOARD_MCP_TOOLS']?.trim().toLowerCase() === 'full' ? 'full' : 'search';
 }
 
-function registerAllTools(server: McpServer): void {
+function registerAllTools(server: McpServer, who: Principal): void {
   for (const tool of BOARD_TOOLS) {
     const hasInput = Object.keys(tool.shape).length > 0;
     server.registerTool(
       tool.name,
       {
         description: tool.description,
-        ...(hasInput ? { inputSchema: tool.shape } : {}),
+        ...(hasInput ? { inputSchema: advertisedShape(tool) } : {}),
       },
-      async (args: unknown) => tool.handler(args as never),
+      async (args: unknown) => runTool(tool, args, who),
     );
   }
 }
 
-function registerSearchTools(server: McpServer): void {
+function registerSearchTools(server: McpServer, who: Principal): void {
   server.registerTool(
     'search_tools',
     {
@@ -500,34 +697,24 @@ function registerSearchTools(server: McpServer): void {
           all_tools: TOOL_NAMES,
         });
       }
-      const parsed = z.object(target.shape).safeParse(args ?? {});
-      if (!parsed.success) {
-        return toolError(
-          `Invalid arguments for ${tool}: ${parsed.error.issues
-            .map((issue) => `${issue.path.join('.') || '(root)'} ${issue.message}`)
-            .join('; ')}`,
-          {
-            reason: 'invalid_arguments',
-            tool,
-            inputSchema: inputSchemaOf(target),
-          },
-        );
-      }
-      return target.handler(parsed.data as never);
+      return runTool(target, args, who);
     },
   );
 }
 
 /** Create one stateless MCP server instance for a single HTTP request. */
-export function createMailboxMcpServer(options: { mode?: McpToolMode } = {}): McpServer {
+export function createMailboxMcpServer(
+  options: { mode?: McpToolMode; principal?: Principal } = {},
+): McpServer {
   const mode = options.mode ?? defaultToolMode();
+  const who: Principal = options.principal ?? { kind: 'open', sub: 'open', name: '' };
   const server = new McpServer(
     { name: 'agent-board', version: '1.2.0' },
     { instructions: mode === 'full' ? FULL_INSTRUCTIONS : SEARCH_INSTRUCTIONS },
   );
 
-  if (mode === 'full') registerAllTools(server);
-  else registerSearchTools(server);
+  if (mode === 'full') registerAllTools(server, who);
+  else registerSearchTools(server, who);
 
   return server;
 }
@@ -543,13 +730,15 @@ function rejectMethod(res: Response): void {
 /** Streamable HTTP MCP endpoint, mounted by the main SSR server at `/mcp`. */
 export function createMcpRouter(): Router {
   const router = Router();
-  router.use(json({ limit: '512kb' }));
+  // Room for a base64 attachment at the upload limit.
+  router.use(json({ limit: Math.ceil(maxUploadBytes() * 1.4) + 64 * 1024 }));
   router.use((req, res, next) => {
     const configured = (process.env['AGENT_BOARD_ALLOWED_HOSTS'] ?? '')
       .split(',')
       .map((host) => host.trim())
       .filter(Boolean);
-    const allowed = new Set(['localhost', '127.0.0.1', '::1', ...configured]);
+    const own = publicHostname();
+    const allowed = new Set(['localhost', '127.0.0.1', '::1', ...configured, ...(own ? [own] : [])]);
     if (!allowed.has(req.hostname)) {
       res.status(403).json({ error: 'host not allowed' });
       return;
@@ -557,7 +746,7 @@ export function createMcpRouter(): Router {
     next();
   });
   router.post('/', async (req: Request, res: Response) => {
-    const server = createMailboxMcpServer();
+    const server = createMailboxMcpServer({ principal: res.locals['principal'] as Principal });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

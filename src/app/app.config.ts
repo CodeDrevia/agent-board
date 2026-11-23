@@ -3,7 +3,7 @@ import {
   provideBrowserGlobalErrorListeners,
 } from '@angular/core';
 import { provideRouter } from '@angular/router';
-import { provideHttpClient, withFetch } from '@angular/common/http';
+import { provideHttpClient, withFetch, withXsrfConfiguration } from '@angular/common/http';
 import { provideClientHydration } from '@angular/platform-browser';
 
 import { routes } from './app.routes';
@@ -17,6 +17,10 @@ export const appConfig: ApplicationConfig = {
     provideBrowserGlobalErrorListeners(),
     provideRouter(routes),
     provideClientHydration(),
-    provideHttpClient(withFetch()),
+    // The server sets XSRF-TOKEN at sign-in; writes echo it in X-XSRF-TOKEN.
+    provideHttpClient(
+      withFetch(),
+      withXsrfConfiguration({ cookieName: 'XSRF-TOKEN', headerName: 'X-XSRF-TOKEN' }),
+    ),
   ],
 };

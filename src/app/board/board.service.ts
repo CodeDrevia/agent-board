@@ -12,6 +12,8 @@ import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { httpResource } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import type {
+  Attachment,
+  TaskEvent,
   Agent,
   Channel,
   MailMessage,
@@ -37,9 +39,22 @@ export class BoardService {
   readonly errorMessage = signal<string | null>(null);
   readonly mutationPending = signal(false);
 
+  /** Target filter (`null` = every target). */
+  readonly targetFilter = signal<string | null>(null);
+
+  /** Signed-in user; board actions are recorded under this name. */
+  readonly me = httpResource<{ name: string; kind: string }>(() => `/api/me`);
+
+  /** Targets in use, for the filter and the form's suggestions. */
+  readonly targets = httpResource<string[]>(() => `/api/targets`, { defaultValue: [] });
+
   /** Query string derived from the current filters. */
   private readonly taskQuery = computed(() => {
     const params = new URLSearchParams();
+    const target = this.targetFilter();
+    if (target !== null) {
+      params.set('target', target);
+    }
     const repo = this.repoFilter();
     const q = this.search().trim();
     if (repo) {
@@ -152,6 +167,7 @@ export class BoardService {
     this.channels.reload();
     this.unreadCounts.reload();
     this.threads.reload();
+    this.targets.reload();
   }
 
   /** Create a new task, then refresh. */
@@ -162,6 +178,8 @@ export class BoardService {
     tags: string;
     priority: number;
     agent: string;
+    target: string;
+    due_date: string | null;
   }): Promise<void> {
     await this.runMutation(firstValueFrom(this.http.post('/api/tasks', input)));
   }
@@ -197,6 +215,47 @@ export class BoardService {
     await this.runMutation(
       firstValueFrom(this.http.post(`/api/tasks/${id}/status`, { status, agent })),
     );
+  }
+
+  /** Write a task's result (text + links). */
+  async setResult(id: number, result: string, links: string[]): Promise<void> {
+    await this.runMutation(firstValueFrom(this.http.post(`/api/tasks/${id}/result`, { result, links })));
+  }
+
+  /** Change who a task is for and its due date. */
+  async updateTask(id: number, patch: { target?: string; due_date?: string | null }): Promise<void> {
+    await this.runMutation(firstValueFrom(this.http.patch(`/api/tasks/${id}`, patch)));
+  }
+
+  async comment(id: number, message: string): Promise<void> {
+    await this.runMutation(firstValueFrom(this.http.post(`/api/tasks/${id}/comment`, { message })));
+  }
+
+  history(id: number): Promise<TaskEvent[]> {
+    return firstValueFrom(this.http.get<TaskEvent[]>(`/api/tasks/${id}/comments`));
+  }
+
+  attachments(id: number): Promise<Attachment[]> {
+    return firstValueFrom(this.http.get<Attachment[]>(`/api/tasks/${id}/attachments`));
+  }
+
+  async upload(id: number, file: File): Promise<void> {
+    await this.runMutation(
+      firstValueFrom(
+        this.http.post(`/api/tasks/${id}/attachments`, file, {
+          params: { filename: file.name },
+          headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        }),
+      ),
+    );
+  }
+
+  async removeAttachment(id: number): Promise<void> {
+    await this.runMutation(firstValueFrom(this.http.delete(`/api/attachments/${id}`)));
+  }
+
+  async logout(): Promise<void> {
+    await firstValueFrom(this.http.post('/auth/logout', {}));
   }
 
   /** Delete a task. */
@@ -260,6 +319,9 @@ export class BoardService {
       const body = error.error as { error?: unknown } | null;
       if (typeof body?.error === 'string') {
         return body.error;
+      }
+      if (error.status === 413) {
+        return 'The file is too large.';
       }
       if (error.status === 0) {
         return 'The board server is unavailable.';

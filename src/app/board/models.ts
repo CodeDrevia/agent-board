@@ -24,6 +24,32 @@ export interface Task {
   created_by: string | null;
   created_at: number;
   updated_at: number;
+  /** Who the task is for ("orchestrator", "chatgpt", a person); '' = anyone. */
+  target: string;
+  result: string;
+  result_links: string[];
+  /** YYYY-MM-DD or null. */
+  due_date: string | null;
+}
+
+/** A file attached to a task. */
+export interface Attachment {
+  id: number;
+  task_id: number;
+  filename: string;
+  content_type: string;
+  size: number;
+  uploaded_by: string | null;
+  created_at: number;
+}
+
+/** One entry of a task's history (comments, results, status changes, files). */
+export interface TaskEvent {
+  id: number;
+  agent: string | null;
+  kind: string;
+  message: string;
+  created_at: number;
 }
 
 /** An agent process that has checked in with the board. */

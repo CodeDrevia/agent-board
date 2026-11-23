@@ -557,7 +557,8 @@ describe('mcp tool search mode', () => {
     };
 
     expect(payload.tools[0].name).toBe('claim_task');
-    expect(payload.tools[0].inputSchema.required?.sort()).toEqual(['agent', 'task_id']);
+    // The acting agent is filled in by the server (DRV-550), so it is not required.
+    expect(payload.tools[0].inputSchema.required?.sort()).toEqual(['task_id']);
     expect(payload.all_tools).toContain('read_inbox');
 
     await client.close();

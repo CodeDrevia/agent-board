@@ -144,6 +144,56 @@ function migrate(db: DatabaseSyncType): void {
       FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
     );
   `);
+  migrateBoardV1(db);
+}
+
+/** Add `column` to `table` unless an earlier run already did (SQLite has no IF NOT EXISTS). */
+function addColumn(db: DatabaseSyncType, table: string, column: string, ddl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+}
+
+/**
+ * Shared task queue (DRV-550): who a task is for, its result, a due date, file
+ * attachments, and the web sign-in sessions. Additive only, so an older board.db
+ * opens unchanged.
+ */
+function migrateBoardV1(db: DatabaseSyncType): void {
+  addColumn(db, 'tasks', 'target', `TEXT NOT NULL DEFAULT ''`);
+  addColumn(db, 'tasks', 'result', `TEXT NOT NULL DEFAULT ''`);
+  addColumn(db, 'tasks', 'result_links', `TEXT NOT NULL DEFAULT '[]'`);
+  addColumn(db, 'tasks', 'due_date', 'TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target);
+
+    CREATE TABLE IF NOT EXISTS attachments (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id      INTEGER NOT NULL,
+      filename     TEXT NOT NULL,
+      content_type TEXT NOT NULL,
+      size         INTEGER NOT NULL,
+      stored_name  TEXT NOT NULL UNIQUE,
+      uploaded_by  TEXT,
+      created_at   INTEGER NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
+
+    -- Web sign-in sessions: only the SHA-256 of the cookie value is stored.
+    CREATE TABLE IF NOT EXISTS web_sessions (
+      id_hash       TEXT PRIMARY KEY,
+      sub           TEXT NOT NULL,
+      username      TEXT NOT NULL,
+      csrf          TEXT NOT NULL,
+      refresh_token TEXT,
+      created_at    INTEGER NOT NULL,
+      expires_at    INTEGER NOT NULL,
+      checked_at    INTEGER NOT NULL,
+      confirmed_at  INTEGER NOT NULL
+    );
+  `);
 }
 
 /**
