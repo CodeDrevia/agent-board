@@ -1095,3 +1095,19 @@ export function leaveChannel(id: string, agent: string): Channel | undefined {
   db().prepare(`DELETE FROM channel_members WHERE channel_id = ? AND agent = ?`).run(id, agent);
   return getChannel(id);
 }
+
+/**
+ * Priority scale: higher sorts first, 0 is the default. Named levels map to
+ * low=-1, normal=0, high=1, urgent=2; any integer is also accepted.
+ */
+export const PRIORITY_LEVELS = { low: -1, normal: 0, high: 1, urgent: 2 } as const;
+
+/** Parse a priority given as an integer, a numeric string, or a named level. */
+export function parsePriority(value: unknown): number | undefined | 'invalid' {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'number') return Number.isInteger(value) ? value : 'invalid';
+  if (typeof value !== 'string') return 'invalid';
+  const key = value.trim().toLowerCase();
+  if (key in PRIORITY_LEVELS) return PRIORITY_LEVELS[key as keyof typeof PRIORITY_LEVELS];
+  return /^-?\d+$/.test(key) ? Number(key) : 'invalid';
+}

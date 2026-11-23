@@ -125,3 +125,65 @@ describe('mcp actor', () => {
     await server.close();
   });
 });
+
+describe('mcp argument names', () => {
+  async function connect(mode: 'full' | 'search') {
+    const server = mcp.createMailboxMcpServer({
+      mode,
+      principal: { kind: 'token', sub: 'token:orchestrator', name: 'orchestrator' },
+    });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 't', version: '1' });
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    return { server, client };
+  }
+  type Res = { isError?: boolean; structuredContent: Record<string, any> };
+
+  it('accepts priority levels as strings and rejects unknown ones', async () => {
+    expect(repo.parsePriority('normal')).toBe(0);
+    expect(repo.parsePriority('URGENT')).toBe(2);
+    expect(repo.parsePriority('3')).toBe(3);
+    expect(repo.parsePriority('soon')).toBe('invalid');
+    const { server, client } = await connect('full');
+    const res = (await client.callTool({
+      name: 'post_task',
+      arguments: { title: 'prio', body: 'text', priority: 'high' },
+    })) as unknown as Res;
+    expect(res.structuredContent['task'].priority).toBe(1);
+    expect(res.structuredContent['task'].body).toBe('text');
+    const bad = (await client.callTool({
+      name: 'post_task',
+      arguments: { title: 'prio', priority: 'soon' },
+    })) as unknown as Res;
+    expect(bad.isError).toBe(true);
+    await client.close();
+    await server.close();
+  });
+
+  for (const mode of ['full', 'search'] as const) {
+    it(`accepts id and message as deprecated aliases (${mode})`, async () => {
+      const { server, client } = await connect(mode);
+      const call = (name: string, args: Record<string, unknown>) =>
+        (mode === 'full'
+          ? client.callTool({ name, arguments: args })
+          : client.callTool({ name: 'call_tool', arguments: { tool: name, args } })) as Promise<Res>;
+      const t = repo.createTask({ title: `alias ${mode}` });
+      const got = await call('get_task', { id: t.id });
+      expect(got.isError).toBeFalsy();
+      expect(got.structuredContent['task'].id).toBe(t.id);
+      const upd = await call('update_task', { id: String(t.id), priority: 'urgent' });
+      expect(upd.structuredContent['task'].priority).toBe(2);
+      const old = await call('comment_task', { task_id: t.id, agent: 'x', message: 'old name' });
+      expect(old.isError).toBeFalsy();
+      const neu = await call('comment_task', { task_id: t.id, agent: 'x', body: 'new name' });
+      expect(neu.isError).toBeFalsy();
+      const texts = repo.listComments(t.id).map((c) => JSON.stringify(c));
+      expect(texts.some((c) => c.includes('old name'))).toBe(true);
+      expect(texts.some((c) => c.includes('new name'))).toBe(true);
+      const missing = await call('get_task', {});
+      expect(missing.isError).toBe(true);
+      await client.close();
+      await server.close();
+    });
+  }
+});

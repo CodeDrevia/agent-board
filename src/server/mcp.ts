@@ -21,6 +21,7 @@ import {
   listTargets,
   parseDueDate,
   parseLinks,
+  parsePriority,
   setResult,
   updateTask,
   claimTask,
@@ -55,6 +56,35 @@ const TASK_STATUSES = [
   'abandoned',
 ] as const satisfies readonly TaskStatus[];
 const AGENT_KINDS = ['claude', 'codex', 'other'] as const satisfies readonly AgentKind[];
+
+// Shared argument schemas: one name and one description per concept.
+const STATUS_HELP =
+  'todo = open, nobody on it; claimed = someone took it; in_progress = being worked; ' +
+  'blocked = waiting on something; done = finished; abandoned = dropped.';
+const TARGET_HELP =
+  'Who the task is for: "orchestrator", "chatgpt", or a person\'s username such as "alessandro" or "lorenzo". Case-insensitive.';
+const taskIdArg = () =>
+  z.coerce
+    .number()
+    .int()
+    .positive()
+    .describe('Task number, e.g. 42 for task #42. ("id" is accepted as a deprecated alias.)');
+const agentArg = () =>
+  z.string().trim().min(1).describe('Your agent name, e.g. "claude-drevia" or "chatgpt".');
+const repoArg = () =>
+  z.string().trim().min(1).describe('Repository the task belongs to, e.g. "clashboard" or "agent-board".');
+const tagsArg = () => z.string().max(1_000).describe('Comma-separated tags, e.g. "bug,frontend".');
+const priorityArg = () =>
+  z
+    .union([z.number().int(), z.enum(['low', 'normal', 'high', 'urgent'])])
+    .describe(
+      'Priority; higher is more urgent and listed first. Either an integer or a level: ' +
+        'low = -1, normal = 0 (default), high = 1, urgent = 2.',
+    );
+const dueDateArg = () => z.string().describe('Due date as YYYY-MM-DD.');
+
+/** Deprecated argument names still accepted: old name -> canonical name. */
+const COMMON_ALIASES: Readonly<Record<string, string>> = { id: 'task_id', message: 'body' };
 
 type ToolResponse = {
   content: { type: 'text'; text: string }[];
@@ -95,15 +125,34 @@ function defineTool<Shape extends z.ZodRawShape>(tool: BoardTool<Shape>): BoardT
   return tool as unknown as BoardTool;
 }
 
+/** Deprecated aliases that apply to one tool (only those whose target it takes). */
+function aliasesOf(tool: BoardTool): [string, string][] {
+  return Object.entries(COMMON_ALIASES).filter(
+    ([alias, canonical]) => canonical in tool.shape && !(alias in tool.shape),
+  );
+}
+
+/** Rewrite deprecated argument names to their canonical names. */
+export function normalizeArgs(tool: BoardTool, args: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...args };
+  for (const [alias, canonical] of aliasesOf(tool)) {
+    if (!(alias in out)) continue;
+    if (out[canonical] === undefined) out[canonical] = out[alias];
+    delete out[alias];
+  }
+  return out;
+}
+
+
 const BOARD_TOOLS: readonly BoardTool[] = [
   defineTool({
     name: 'heartbeat',
     description: 'Register or refresh an agent identity on the shared board.',
     keywords: 'check in presence online session start identity',
     shape: {
-      agent: z.string().trim().min(1),
-      kind: z.enum(AGENT_KINDS).optional(),
-      host: z.string().trim().min(1).optional(),
+      agent: agentArg(),
+      kind: z.enum(AGENT_KINDS).optional().describe('What runs this agent: claude, codex or other.'),
+      host: z.string().trim().min(1).optional().describe('Machine the agent runs on, e.g. "lorenzo-dev".'),
     },
     handler: ({ agent, kind, host }) => toolResult({ agent: heartbeat({ name: agent, kind, host }) }),
   }),
@@ -114,15 +163,15 @@ const BOARD_TOOLS: readonly BoardTool[] = [
       'List open tasks on the shared queue, highest priority first. Filter by target to find work meant for you (e.g. target="chatgpt").',
     keywords: 'find work backlog todo search board repo status target queue for me assigned',
     shape: {
-      repo: z.string().trim().min(1).optional(),
-      status: z.enum(TASK_STATUSES).optional(),
-      q: z.string().trim().min(1).optional(),
+      repo: repoArg().optional(),
+      status: z.enum(TASK_STATUSES).optional().describe(`Only tasks in this status. ${STATUS_HELP}`),
+      q: z.string().trim().min(1).optional().describe('Free-text search in title, body and tags.'),
       target: z
         .string()
         .trim()
         .max(64)
         .optional()
-        .describe('Only tasks for this target ("orchestrator", "chatgpt", a person); "" = untargeted'),
+        .describe(`Only tasks for this target. ${TARGET_HELP} Pass "" for tasks meant for anyone.`),
     },
     handler: ({ repo, status, q, target }) =>
       toolResult({ tasks: listTasks({ repo, status, q, target }) }),
@@ -130,28 +179,30 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'post_task',
-    description: 'Post a new task to the shared Kanban board.',
+    description: 'Post a new task to the shared board. Put the task text in body; set target to address it to someone.',
     keywords: 'create add new work item ticket',
     shape: {
-      title: z.string().trim().min(1).max(500),
-      repo: z.string().trim().min(1).optional(),
-      body: z.string().max(16_000).optional(),
-      tags: z.string().max(1_000).optional(),
-      priority: z.number().int().optional(),
-      agent: z.string().trim().min(1).optional(),
+      title: z.string().trim().min(1).max(500).describe('Short one-line summary of the work.'),
+      repo: repoArg().optional(),
+      body: z.string().max(16_000).optional().describe('Full task text (markdown): what to do and why.'),
+      tags: tagsArg().optional(),
+      priority: priorityArg().optional(),
+      agent: agentArg().optional().describe('Creator of the task.'),
       target: z
         .string()
         .trim()
         .max(64)
         .optional()
-        .describe('Who it is for: "orchestrator", "chatgpt", "alessandro", "lorenzo"; omit for anyone'),
-      due_date: z.string().optional().describe('YYYY-MM-DD'),
+        .describe(`${TARGET_HELP} Omit for anyone.`),
+      due_date: dueDateArg().optional(),
     },
     handler: ({ title, repo, body, tags, priority, agent, target, due_date }) => {
       const due = parseDueDate(due_date);
       if (due === 'invalid') return toolError('due_date must be YYYY-MM-DD.');
+      const prio = parsePriority(priority);
+      if (prio === 'invalid') return toolError('priority must be an integer or low/normal/high/urgent.');
       return toolResult({
-        task: createTask({ title, repo, body, tags, priority, created_by: agent, target, due_date: due }),
+        task: createTask({ title, repo, body, tags, priority: prio, created_by: agent, target, due_date: due }),
       });
     },
   }),
@@ -161,19 +212,21 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Edit a task: title, details, tags, priority, repo, target, or due date.',
     keywords: 'edit change retarget reassign due deadline priority modify',
     shape: {
-      task_id: z.number().int().positive(),
-      title: z.string().trim().min(1).max(500).optional(),
-      body: z.string().max(16_000).optional(),
-      tags: z.string().max(1_000).optional(),
-      priority: z.number().int().optional(),
-      repo: z.string().trim().min(1).optional(),
-      target: z.string().trim().max(64).optional(),
-      due_date: z.string().nullable().optional().describe('YYYY-MM-DD, or null to clear'),
+      task_id: taskIdArg(),
+      title: z.string().trim().min(1).max(500).optional().describe('New one-line summary.'),
+      body: z.string().max(16_000).optional().describe('New full task text (replaces the old one).'),
+      tags: tagsArg().optional(),
+      priority: priorityArg().optional(),
+      repo: repoArg().optional(),
+      target: z.string().trim().max(64).optional().describe(`${TARGET_HELP} Pass "" to make it for anyone.`),
+      due_date: dueDateArg().nullable().optional().describe('Due date as YYYY-MM-DD, or null to clear it.'),
     },
-    handler: ({ task_id, due_date, ...patch }) => {
+    handler: ({ task_id, due_date, priority, ...patch }) => {
       const due = due_date === undefined ? undefined : parseDueDate(due_date);
       if (due === 'invalid') return toolError('due_date must be YYYY-MM-DD.');
-      const task = updateTask(task_id, { ...patch, due_date: due });
+      const prio = parsePriority(priority);
+      if (prio === 'invalid') return toolError('priority must be an integer or low/normal/high/urgent.');
+      const task = updateTask(task_id, { ...patch, priority: prio, due_date: due });
       return task
         ? toolResult({ task })
         : toolError(`Task #${task_id} was not found.`, { reason: 'not_found' });
@@ -186,10 +239,10 @@ const BOARD_TOOLS: readonly BoardTool[] = [
       'Write the outcome of a task (text plus links such as PRs or docs). Replaces any earlier result.',
     keywords: 'result outcome answer deliver output links report finish',
     shape: {
-      task_id: z.number().int().positive(),
-      result: z.string().max(16_000),
-      links: z.array(z.string()).max(20).optional().describe('http(s) URLs'),
-      agent: z.string().trim().min(1),
+      task_id: taskIdArg(),
+      result: z.string().max(16_000).describe('What was done or found (markdown).'),
+      links: z.array(z.string()).max(20).optional().describe('Up to 20 http(s) URLs, e.g. PRs or docs.'),
+      agent: agentArg(),
     },
     handler: ({ task_id, result, links, agent }) => {
       const parsed = parseLinks(links);
@@ -214,11 +267,11 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Attach a file to a task (base64 content, size limited).',
     keywords: 'upload file attach document image',
     shape: {
-      task_id: z.number().int().positive(),
-      filename: z.string().trim().min(1).max(200),
-      content_base64: z.string().min(1),
-      content_type: z.string().max(100).optional(),
-      agent: z.string().trim().min(1),
+      task_id: taskIdArg(),
+      filename: z.string().trim().min(1).max(200).describe('File name shown on the board, e.g. "report.pdf".'),
+      content_base64: z.string().min(1).describe('File content, base64-encoded.'),
+      content_type: z.string().max(100).optional().describe('MIME type, e.g. "application/pdf".'),
+      agent: agentArg(),
     },
     handler: ({ task_id, filename, content_base64, content_type, agent }) => {
       if (!getTask(task_id)) return toolError(`Task #${task_id} was not found.`, { reason: 'not_found' });
@@ -249,7 +302,9 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     name: 'read_attachment',
     description: 'Read one attachment of a task; returns its content as base64 (up to 2 MB).',
     keywords: 'download file open attachment content',
-    shape: { attachment_id: z.number().int().positive() },
+    shape: {
+      attachment_id: z.coerce.number().int().positive().describe('Attachment number, from get_task.'),
+    },
     handler: ({ attachment_id }) => {
       const a = getAttachment(attachment_id);
       if (!a) return toolError(`Attachment #${attachment_id} was not found.`, { reason: 'not_found' });
@@ -267,9 +322,9 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'get_task',
-    description: 'Fetch one task by id, with its result, attachments, and comments.',
+    description: 'Fetch one task by task_id, with its result, attachments, and comments.',
     keywords: 'read detail single show',
-    shape: { task_id: z.number().int().positive() },
+    shape: { task_id: taskIdArg() },
     handler: ({ task_id }) => {
       const task = getTask(task_id);
       return task
@@ -284,9 +339,9 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'claim_task',
-    description: 'Atomically claim a free task for an agent.',
+    description: 'Claim a free (todo) task so others know you are on it. Fails if someone else holds it.',
     keywords: 'take own lock assign reserve',
-    shape: { task_id: z.number().int().positive(), agent: z.string().trim().min(1) },
+    shape: { task_id: taskIdArg(), agent: agentArg() },
     handler: ({ task_id, agent }) => {
       const result = claimTask(task_id, agent);
       return result.ok
@@ -304,7 +359,7 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     name: 'release_task',
     description: 'Release an agent-owned claim back to the shared task pool.',
     keywords: 'give back unclaim abandon drop stop',
-    shape: { task_id: z.number().int().positive(), agent: z.string().trim().min(1) },
+    shape: { task_id: taskIdArg(), agent: agentArg() },
     handler: ({ task_id, agent }) => {
       const result = releaseTask(task_id, agent);
       return result.ok
@@ -320,16 +375,22 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'set_task_status',
-    description: 'Advance, block, resume, complete, abandon, or reopen a task.',
+    description: 'Change a task status: todo, claimed, in_progress, blocked, done, abandoned. Optional note in body.',
     keywords: 'start done finish in_progress blocked progress update',
     shape: {
-      task_id: z.number().int().positive(),
-      status: z.enum(TASK_STATUSES),
-      agent: z.string().trim().min(1),
-      message: z.string().trim().min(1).max(16_000).optional(),
+      task_id: taskIdArg(),
+      status: z.enum(TASK_STATUSES).describe(`New status. ${STATUS_HELP}`),
+      agent: agentArg(),
+      body: z
+        .string()
+        .trim()
+        .min(1)
+        .max(16_000)
+        .optional()
+        .describe('Optional note on the change, e.g. why it is blocked. ("message" is a deprecated alias.)'),
     },
-    handler: ({ task_id, status, agent, message }) => {
-      const result = setStatus(task_id, status, agent, message);
+    handler: ({ task_id, status, agent, body }) => {
+      const result = setStatus(task_id, status, agent, body);
       return result.ok
         ? toolResult({ task: result.task })
         : toolError(`Could not set task #${task_id} to ${status}: ${result.reason}.`, result);
@@ -338,15 +399,20 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'comment_task',
-    description: 'Add an agent comment to a shared-board task.',
+    description: 'Add a comment to a task. The comment text goes in body.',
     keywords: 'note annotate context discuss',
     shape: {
-      task_id: z.number().int().positive(),
-      agent: z.string().trim().min(1),
-      message: z.string().trim().min(1).max(16_000),
+      task_id: taskIdArg(),
+      agent: agentArg(),
+      body: z
+        .string()
+        .trim()
+        .min(1)
+        .max(16_000)
+        .describe('Comment text (markdown). ("message" is a deprecated alias.)'),
     },
-    handler: ({ task_id, agent, message }) =>
-      commentTask(task_id, agent, message)
+    handler: ({ task_id, agent, body }) =>
+      commentTask(task_id, agent, body)
         ? toolResult({ posted: true, task_id })
         : toolError(`Task #${task_id} was not found.`, { reason: 'not_found' }),
   }),
@@ -356,27 +422,36 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Read recent public activity from the shared board.',
     keywords: 'feed history log recent events',
     shape: {
-      repo: z.string().trim().min(1).optional(),
-      limit: z.number().int().min(1).max(500).optional(),
+      repo: repoArg().optional(),
+      limit: z.number().int().min(1).max(500).optional().describe('Most recent N events (default server-side).'),
     },
     handler: ({ repo, limit }) => toolResult({ activity: listActivity({ repo, limit }) }),
   }),
 
   defineTool({
     name: 'send_message',
-    description: 'Send a durable mailbox message to another agent.',
+    description: 'Send a durable mailbox message to another agent or a channel. The text goes in body.',
     keywords: 'mail dm write tell notify channel post',
     shape: {
-      from: z.string().trim().min(1).describe('Sending agent identity'),
-      to: z.string().trim().min(1).describe('Recipient agent identity'),
-      message: z.string().trim().min(1).max(16_000),
-      thread_id: z.string().trim().min(1).max(200).optional(),
+      from: z.string().trim().min(1).describe('Your agent name (the sender).'),
+      to: z
+        .string()
+        .trim()
+        .min(1)
+        .describe('Recipient agent name, or "#<channel-id>" to post to a channel.'),
+      body: z
+        .string()
+        .trim()
+        .min(1)
+        .max(16_000)
+        .describe('Message text. ("message" is a deprecated alias.)'),
+      thread_id: z.string().trim().min(1).max(200).optional().describe('Conversation thread to reply in; omit to start one.'),
     },
-    handler: ({ from, to, message, thread_id }) => {
+    handler: ({ from, to, body, thread_id }) => {
       const result = sendMessage({
         sender: from,
         recipient: to,
-        body: message,
+        body,
         thread_id,
       });
       return result.ok
@@ -393,10 +468,10 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Read pending messages addressed to an agent, oldest first.',
     keywords: 'mail unread poll check pending receive',
     shape: {
-      agent: z.string().trim().min(1),
-      after_id: z.number().int().nonnegative().optional(),
-      limit: z.number().int().min(1).max(200).optional(),
-      include_acknowledged: z.boolean().optional(),
+      agent: agentArg(),
+      after_id: z.number().int().nonnegative().optional().describe('Only messages after this id (pass next_cursor).'),
+      limit: z.number().int().min(1).max(200).optional().describe('Maximum messages to return.'),
+      include_acknowledged: z.boolean().optional().describe('Also return messages already acknowledged.'),
     },
     handler: ({ agent, after_id, limit, include_acknowledged }) => {
       const messages = readInbox({
@@ -420,11 +495,11 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     keywords: 'find history past mail grep transcript',
     shape: {
       q: z.string().trim().min(1).max(500).optional().describe('Free-text match'),
-      thread_id: z.string().trim().min(1).max(200).optional(),
-      agent: z.string().trim().min(1).optional().describe('Sender or recipient'),
-      unread_only: z.boolean().optional().describe('Only messages not yet acknowledged'),
-      after_id: z.number().int().nonnegative().optional(),
-      limit: z.number().int().min(1).max(200).optional(),
+      thread_id: z.string().trim().min(1).max(200).optional().describe('Only this conversation thread.'),
+      agent: z.string().trim().min(1).optional().describe('Only messages sent or received by this agent.'),
+      unread_only: z.boolean().optional().describe('Only messages not yet acknowledged.'),
+      after_id: z.number().int().nonnegative().optional().describe('Only messages after this id (pass next_cursor).'),
+      limit: z.number().int().min(1).max(200).optional().describe('Maximum messages to return.'),
     },
     handler: ({ q, thread_id, agent, unread_only, after_id, limit }) => {
       const messages = listMessages({ q, thread_id, agent, unread_only, after_id, limit });
@@ -439,7 +514,7 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     name: 'list_threads',
     description: 'List conversation threads with their message and unread counts.',
     keywords: 'conversations topics mail overview',
-    shape: { limit: z.number().int().min(1).max(500).optional() },
+    shape: { limit: z.number().int().min(1).max(500).optional().describe('Maximum threads to return.') },
     handler: ({ limit }) => toolResult({ threads: listThreads({ limit }) }),
   }),
 
@@ -448,8 +523,8 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Mark one received message as acknowledged.',
     keywords: 'ack handled read mark done mail',
     shape: {
-      agent: z.string().trim().min(1),
-      message_id: z.number().int().positive(),
+      agent: agentArg(),
+      message_id: z.coerce.number().int().positive().describe('Id of the message, from read_inbox.'),
     },
     handler: ({ agent, message_id }) => {
       const message = acknowledgeMessage(message_id, agent);
@@ -481,9 +556,9 @@ const BOARD_TOOLS: readonly BoardTool[] = [
       'Create a group-chat channel. Send to it with send_message using to="#<channel-id>".',
     keywords: 'new room group broadcast',
     shape: {
-      name: z.string().trim().min(1).max(200),
-      agent: z.string().trim().min(1).optional().describe('Creator; auto-joined as a member'),
-      members: z.array(z.string().trim().min(1)).optional(),
+      name: z.string().trim().min(1).max(200).describe('Channel name, e.g. "release-planning".'),
+      agent: agentArg().optional().describe('Creator; auto-joined as a member.'),
+      members: z.array(z.string().trim().min(1)).optional().describe('Agent names to add as members.'),
     },
     handler: ({ name, agent, members }) => {
       const result = createChannel({ name, created_by: agent, members });
@@ -498,8 +573,8 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Join a group-chat channel so its messages reach your inbox.',
     keywords: 'subscribe enter room group',
     shape: {
-      channel_id: z.string().trim().min(1),
-      agent: z.string().trim().min(1),
+      channel_id: z.string().trim().min(1).describe('Channel id, from list_channels (without the "#").'),
+      agent: agentArg(),
     },
     handler: ({ channel_id, agent }) => {
       const channel = joinChannel(channel_id, agent);
@@ -514,8 +589,8 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description: 'Leave a group-chat channel.',
     keywords: 'unsubscribe exit room group',
     shape: {
-      channel_id: z.string().trim().min(1),
-      agent: z.string().trim().min(1),
+      channel_id: z.string().trim().min(1).describe('Channel id, from list_channels (without the "#").'),
+      agent: agentArg(),
     },
     handler: ({ channel_id, agent }) => {
       const channel = leaveChannel(channel_id, agent);
@@ -545,18 +620,29 @@ function actorKeys(tool: BoardTool): string[] {
  * of naming any agent.
  */
 function withActor(tool: BoardTool, args: unknown, who: Principal): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...((args as Record<string, unknown>) ?? {}) };
+  const out = normalizeArgs(tool, { ...((args as Record<string, unknown>) ?? {}) });
   for (const key of actorKeys(tool)) out[key] = actorFor(who, out[key]);
   return out;
 }
 
 /** The advertised schema: actor fields are optional (the server fills them in). */
-function advertisedShape(tool: BoardTool): z.ZodRawShape {
+function advertisedShape(tool: BoardTool, withAliases = false): z.ZodRawShape {
   const shape: z.ZodRawShape = { ...tool.shape };
   for (const key of actorKeys(tool)) {
     shape[key] = (tool.shape[key] as z.ZodTypeAny)
       .optional()
-      .describe('Acting agent. Ignored for signed-in users, who act as themselves.');
+      .describe('Acting agent name. Ignored for signed-in users, who act as themselves.');
+  }
+  if (!withAliases) return shape;
+  // Directly registered tools are validated by the SDK, which drops unknown
+  // keys, so the deprecated aliases must be in the schema to reach runTool.
+  // The canonical field is then optional here and still enforced in runTool.
+  for (const [alias, canonical] of aliasesOf(tool)) {
+    const field = tool.shape[canonical] as z.ZodTypeAny;
+    shape[canonical] = field.isOptional()
+      ? field
+      : field.optional().describe(`${field.description ?? ''} Required.`.trim());
+    shape[alias] = field.optional().describe(`Deprecated alias of ${canonical}; use ${canonical}.`);
   }
   return shape;
 }
@@ -627,7 +713,7 @@ function registerAllTools(server: McpServer, who: Principal): void {
       tool.name,
       {
         description: tool.description,
-        ...(hasInput ? { inputSchema: advertisedShape(tool) } : {}),
+        ...(hasInput ? { inputSchema: advertisedShape(tool, true) } : {}),
       },
       async (args: unknown) => runTool(tool, args, who),
     );
