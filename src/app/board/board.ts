@@ -19,6 +19,7 @@ import { isPlatformBrowser } from '@angular/common';
 import { BoardService } from './board.service';
 import { Chat } from '../chat/chat/chat';
 import { SendButton } from '../send-button/send-button';
+import { LinkedText } from '../linked-text/linked-text';
 import {
   COLUMNS,
   ONLINE_WINDOW_MS,
@@ -34,7 +35,7 @@ const IDENTITY_KEY = 'agent-board.identity';
 
 @Component({
   selector: 'app-board',
-  imports: [Chat, SendButton],
+  imports: [Chat, SendButton, LinkedText],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './board.html',
   styleUrl: './board.scss',

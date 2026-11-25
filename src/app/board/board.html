@@ -213,7 +213,7 @@
             <span>{{ task.repo }}</span>
           </div>
           @if (task.body) {
-            <p>{{ task.body }}</p>
+            <p><app-linked-text [text]="task.body" /></p>
           }
           <div class="archive-meta">
             <span>Completed {{ ago(task.updated_at) }}</span>
@@ -262,7 +262,7 @@
 
                 <h3>{{ task.title }}</h3>
                 @if (task.body) {
-                  <p class="task-body">{{ task.body }}</p>
+                  <p class="task-body"><app-linked-text [text]="task.body" /></p>
                 }
 
                 @if (chips(task.tags).length) {
@@ -274,7 +274,7 @@
                 }
 
                 @if (task.result) {
-                  <p class="task-result"><strong>Result:</strong> {{ task.result }}</p>
+                  <p class="task-result"><strong>Result:</strong> <app-linked-text [text]="task.result" /></p>
                 }
                 @if (task.result_links.length) {
                   <ul class="result-links">
@@ -376,7 +376,7 @@
                         <li [attr.data-kind]="event.kind">
                           <strong>{{ event.agent ?? 'someone' }}</strong>
                           <span class="muted">{{ event.kind }} · {{ ago(event.created_at) }}</span>
-                          <p>{{ event.message }}</p>
+                          <p><app-linked-text [text]="event.message" /></p>
                         </li>
                       } @empty {
                         <li class="muted">Nothing yet.</li>

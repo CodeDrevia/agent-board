@@ -168,7 +168,7 @@
                 <span class="ack-state done">Acknowledged</span>
               }
             </header>
-            <p>{{ message.body }}</p>
+            <p><app-linked-text [text]="message.body" /></p>
           </div>
         </li>
       } @empty {

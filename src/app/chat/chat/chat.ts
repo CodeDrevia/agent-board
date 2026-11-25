@@ -1,11 +1,12 @@
 import { ChangeDetectionStrategy, Component, computed, inject, input, signal } from '@angular/core';
 import { ScrollingModule } from '@angular/cdk/scrolling';
+import { LinkedText } from '../../linked-text/linked-text';
 import { BoardService } from '../../board/board.service';
 import { CHANNEL_PREFIX, type Channel, type MailMessage } from '../../board/models';
 
 @Component({
   selector: 'app-chat',
-  imports: [ScrollingModule],
+  imports: [ScrollingModule, LinkedText],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './chat.html',
   styleUrl: './chat.scss',
