@@ -213,6 +213,13 @@ export function createApiRouter(): Router {
       res.status(404).json({ error: 'queue not found' });
       return;
     }
+    for (const field of ['agent', 'thread_id']) {
+      const value: unknown = req.body?.[field];
+      if (value !== undefined && value !== null && typeof value !== 'string') {
+        res.status(400).json({ error: `${field} must be a string` });
+        return;
+      }
+    }
     const agent = explicitActorFor(principal(res), req.body?.agent);
     if (!agent) {
       res.status(400).json({

@@ -128,9 +128,14 @@ function printQueueResult(body) {
   }
 }
 
-/** Lease flag in minutes → milliseconds for the API. */
+/** Lease flag in minutes → milliseconds for the API; a bad value exits instead of using the default. */
 function leaseMs(flags) {
-  return flags['lease-min'] ? Math.round(Number(flags['lease-min']) * 60000) : undefined;
+  if (flags['lease-min'] === undefined) return undefined;
+  const minutes = Number(flags['lease-min']);
+  if (typeof flags['lease-min'] !== 'string' || !Number.isFinite(minutes) || minutes <= 0) {
+    die(`--lease-min must be a positive number of minutes, got: ${flags['lease-min']}`);
+  }
+  return Math.round(minutes * 60000);
 }
 
 function sleep(ms) {
@@ -475,12 +480,19 @@ async function main() {
       const agent = flags.agent ? String(flags.agent) : process.env.AGENT_BOARD_NAME;
       if (!agent)
         die('queue commands need a name only you use: set AGENT_BOARD_NAME or pass --agent A');
+      const lease = leaseMs(flags);
+      if (action === 'join' && !flags.thread) {
+        console.error(
+          `warning: joining ${name} as ${agent} with no --thread: every session named ${agent} ` +
+            'without --thread is this same member and can renew or release your hold',
+        );
+      }
       const { status, body } = await api(
         'POST',
         `/api/queues/${encodeURIComponent(name)}/${action}`,
         {
           agent,
-          lease_ms: leaseMs(flags),
+          lease_ms: lease,
           note: flags.note ? String(flags.note) : undefined,
           thread_id: flags.thread ? String(flags.thread) : undefined,
         },

@@ -80,6 +80,12 @@ describe('shared-resource queues', () => {
       // A token caller must name itself: falling back to the token's name would make
       // every such caller the same member.
       expect((await post('/queues/zen-browser/join', {})).status).toBe(400);
+      // A wrongly typed identity is an error, not silently "no thread" or "no name".
+      expect((await post('/queues/zen-browser/join', { agent: 'x', thread_id: 42 })).status).toBe(
+        400,
+      );
+      expect((await post('/queues/zen-browser/join', { agent: 7 })).status).toBe(400);
+      expect(queues.getQueue('zen-browser')!.waiters).toHaveLength(agents.length - 1);
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -177,8 +183,16 @@ describe('shared-resource queues', () => {
     expect(queues.deleteQueue('free-one')).toMatchObject({ ok: true });
   });
 
-  it('hands an expired lease to the next waiter and sends the queue webhooks', () => {
+  it('hands an expired lease to the next waiter and sends the queue webhooks after commit', async () => {
     const sent: Record<string, unknown>[] = [];
+    // What a second connection sees when each webhook goes out: a send before COMMIT
+    // would see the previous holder (WAL readers see only committed data).
+    const seen: unknown[] = [];
+    const { DatabaseSync } = await import('node:sqlite');
+    const reader = new DatabaseSync(process.env['AGENT_BOARD_DB']!, { readOnly: true });
+    const readHolder = reader.prepare(
+      `SELECT holder AS agent, holder_thread_id AS thread_id FROM queues WHERE name = 'phone'`,
+    );
     vi.stubEnv('AGENT_BOARD_NOTIFY_IN_TESTS', '1');
     vi.stubEnv('AGENT_BOARD_WEBHOOK_URLS', 'https://hooks.example.com/board');
     // dispatch calls fetch before its first await, so every send is recorded by
@@ -187,6 +201,7 @@ describe('shared-resource queues', () => {
       'fetch',
       vi.fn(async (_url: string, init: RequestInit) => {
         sent.push(JSON.parse(init.body as string));
+        seen.push(readHolder.get() ?? null);
         return new Response(null, { status: 204 });
       }),
     );
@@ -227,6 +242,8 @@ describe('shared-resource queues', () => {
         payload('queue.expired', 'a', 'mcp:thread-a', aExpiredAt),
         payload('queue.granted', 'b', 'mcp:thread-b', queue.holder!.lease_expires_at),
       ]);
+      const b = { agent: 'b', thread_id: 'mcp:thread-b' };
+      expect(seen).toEqual([b, b]);
 
       // Any queue call frees an expired lease too, before deciding.
       const bExpiredAt = expireLease('phone');
@@ -241,8 +258,25 @@ describe('shared-resource queues', () => {
         payload('queue.expired', 'b', 'mcp:thread-b', bExpiredAt),
         payload('queue.granted', 'c', 'mcp:thread-c', cExpiresAt as number),
       ]);
-      expect(new Set(sent.map((p) => p['delivery_id'])).size).toBe(4);
+      const c = { agent: 'c', thread_id: 'mcp:thread-c' };
+      expect(seen.slice(2)).toEqual([c, c]);
+
+      // A forced delete tells the evicted holder and the dropped waiters.
+      expect(queues.deleteQueue('phone', true)).toMatchObject({ ok: true });
+      expect(sent.slice(4)).toEqual([
+        {
+          event: 'queue.deleted',
+          delivery_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          queue: { name: 'phone' },
+          holder: c,
+          waiters: [{ agent: 'd', thread_id: null }],
+          board_url: 'https://board.bombatomica64.dev',
+        },
+      ]);
+      expect(seen[4]).toBeNull();
+      expect(new Set(sent.map((p) => p['delivery_id'])).size).toBe(5);
     } finally {
+      reader.close();
       vi.unstubAllGlobals();
       vi.unstubAllEnvs();
     }
@@ -319,6 +353,10 @@ describe('shared-resource queues', () => {
         arguments: { queue: 'mcp-lock' },
       });
       expect(held.structuredContent).toMatchObject({ reason: 'held' });
+      // Agents are told who holds it, not invited to force the delete.
+      const heldText = (held.content as { text: string }[])[0].text;
+      expect(heldText).toContain('held by alice in thread mcp:A');
+      expect(heldText).not.toContain('force');
       const forced = await two.client.callTool({
         name: 'queue_delete',
         arguments: { queue: 'mcp-lock', force: true },

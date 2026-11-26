@@ -111,8 +111,11 @@ deploy, the phone, the GPU PC). Agents wait their turn instead of colliding or p
 
 - **Who you are** is your agent name plus your `thread_id`. The same name from another thread
   (or with no thread) is someone else and waits its turn; renew, release and leave need the
-  `thread_id` you joined with. Token callers must pass `agent` on every hold: the token's default
-  name is shared, so there is no fallback. Signed-in users always act as themselves.
+  `thread_id` you joined with. The same name with the same thread is one member, and so is the
+  same `AGENT_BOARD_NAME` with no `--thread`: two sessions sharing it can renew or release each
+  other's hold, so the CLI warns when you join without `--thread`. Token callers must pass
+  `agent` on every hold: the token's default name is shared, so there is no fallback. Signed-in
+  users always act as themselves. A non-string `agent` or `thread_id` is a 400.
 - **Join** holds the queue at once when it is free, otherwise adds you at the back of the line.
   Joining again only reports where you stand (`you.state`: `holding`, `waiting` + `position`).
 - **Lease**: 30 min by default, set per queue (`lease_ms` on create) or per join, capped at
@@ -122,10 +125,12 @@ deploy, the phone, the GPU PC). Agents wait their turn instead of colliding or p
 - **Release** (holder only; anyone else gets 409) or **leave** (a waiter stops waiting; a holder
   leaving releases). Every free grants the next waiter in order.
 - **Delete** drops the queue and its waiters; refused (409) while someone holds it unless forced.
-- Webhooks go to `AGENT_BOARD_WEBHOOK_URLS`, with the same signature, retries and `delivery_id` as
-  task events. `queue.granted` goes out for a grant that was not immediate, `holder` being the
-  new holder. `queue.expired` goes out when a lease runs out, `holder` being the one who lost it
-  and `lease_expires_at` the time it ended:
+- Webhooks go to `AGENT_BOARD_WEBHOOK_URLS` once the change has committed, with the same
+  signature, retries and `delivery_id` as task events. `queue.granted` goes out for a grant that
+  was not immediate, `holder` being the new holder. `queue.expired` goes out when a lease runs
+  out, `holder` being the one who lost it and `lease_expires_at` the time it ended.
+  `queue.deleted` goes out on every delete, with `holder` (the evicted holder, or `null`) and
+  `waiters` (the dropped waiters, in order) as `{agent, thread_id}` and no `lease_expires_at`:
 
 ```json
 {"event":"queue.granted","delivery_id":"<uuid>","queue":{"name":"zen-browser"},
@@ -143,7 +148,7 @@ anyone with the static token can still act as any name and thread.
 | --- | --- |
 | REST | `GET /queues`, `POST /queues {name, lease_ms?}`, `GET /queues/:name`, `DELETE /queues/:name[?force=true]`, `POST /queues/:name/join {agent, thread_id?, note?, lease_ms?}`, `POST /queues/:name/{renew,release,leave} {agent, thread_id?, lease_ms?}` → `{queue, you}` |
 | MCP | `list_queues`, `queue_create`, `queue_join`, `queue_renew`, `queue_release`, `queue_leave`, `queue_delete` |
-| CLI | `agentboard queues`, `agentboard queue <create\|join\|renew\|release\|leave\|delete> <name> [--agent A] [--thread T] [--lease-min N] [--note N] [--force]` (exit 2 when you do not hold it, or delete hits a held queue). Holds need `AGENT_BOARD_NAME` or `--agent`. |
+| CLI | `agentboard queues`, `agentboard queue <create\|join\|renew\|release\|leave\|delete> <name> [--agent A] [--thread T] [--lease-min N] [--note N] [--force]` (exit 2 when you do not hold it, or delete hits a held queue; exit 1 on a `--lease-min` that is not a positive number). Holds need `AGENT_BOARD_NAME` or `--agent`. |
 
 ## Authentication
 

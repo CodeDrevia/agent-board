@@ -773,7 +773,8 @@ const BOARD_TOOLS: readonly BoardTool[] = [
   defineTool({
     name: 'queue_delete',
     description:
-      'Delete a queue and drop its waiters. Refused while someone holds it unless force is true.',
+      'Delete a queue and drop its waiters; a queue.deleted webhook names the holder and waiters it removed. ' +
+      'Refused while someone holds it unless force is true.',
     keywords: 'remove lock resource mutex drop',
     shape: {
       queue: queueArg(),
@@ -786,10 +787,9 @@ const BOARD_TOOLS: readonly BoardTool[] = [
       if (result.ok) return toolResult({ deleted: result.deleted });
       if (result.reason === 'not_found')
         return toolError(`Queue "${name}" does not exist.`, { reason: 'not_found' });
-      return toolError(
-        `Queue "${name}" is held by ${result.queue.holder!.agent}; pass force: true to delete it anyway.`,
-        result,
-      );
+      const { agent, thread_id } = result.queue.holder!;
+      const by = thread_id ? `${agent} in thread ${thread_id}` : agent;
+      return toolError(`Queue "${name}" is held by ${by}.`, result);
     },
   }),
 ];

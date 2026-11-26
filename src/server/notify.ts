@@ -8,7 +8,7 @@
  *   `AGENT_BOARD_DISCORD_CHANNEL_ID`) for new tasks, except those whose target is
  *   in `AGENT_BOARD_DISCORD_SKIP_TARGETS`.
  *
- * Queue events (`queue.granted`, `queue.expired`) go to the webhooks only.
+ * Queue events (`queue.granted`, `queue.expired`, `queue.deleted`) go to the webhooks only.
  *
  * Delivery is fire-and-forget: it never throws into, or delays, the request
  * that created the task. URLs and tokens may carry secrets, so logs name only
@@ -22,18 +22,32 @@ export type TaskEventName = 'task.created' | 'task.retargeted';
 /** Targets whose new tasks never reach Discord unless the env says otherwise. */
 export const DEFAULT_DISCORD_SKIP_TARGETS = 'orchestrator,clashboard,brain,side';
 
+export interface QueueMemberRef {
+  agent: string;
+  thread_id: string | null;
+}
+
 /**
  * `queue.granted`: a waiter now holds the queue (after a release, an expiry or the
  * holder leaving). `queue.expired`: the holder's lease ran out and they no longer
  * hold it. `agent`/`thread_id` are the new holder for a grant, the old one for an expiry.
+ * `queue.deleted`: the queue is gone; `holder` lost it (null when it was free) and
+ * `waiters` were dropped, in their old order.
  */
-export interface QueueEvent {
-  event: 'queue.granted' | 'queue.expired';
-  queue: string;
-  agent: string;
-  thread_id: string | null;
-  lease_expires_at: number;
-}
+export type QueueEvent =
+  | {
+      event: 'queue.granted' | 'queue.expired';
+      queue: string;
+      agent: string;
+      thread_id: string | null;
+      lease_expires_at: number;
+    }
+  | {
+      event: 'queue.deleted';
+      queue: string;
+      holder: QueueMemberRef | null;
+      waiters: QueueMemberRef[];
+    };
 
 export interface NotifyConfig {
   webhookUrls: string[];
@@ -106,10 +120,12 @@ export function buildQueueEventPayload(
   boardUrl: string,
   deliveryId: string = randomUUID(),
 ) {
+  const base = { event: e.event, delivery_id: deliveryId, queue: { name: e.queue } };
+  if (e.event === 'queue.deleted') {
+    return { ...base, holder: e.holder, waiters: e.waiters, board_url: boardUrl };
+  }
   return {
-    event: e.event,
-    delivery_id: deliveryId,
-    queue: { name: e.queue },
+    ...base,
     holder: { agent: e.agent, thread_id: e.thread_id },
     lease_expires_at: e.lease_expires_at,
     board_url: boardUrl,

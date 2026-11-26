@@ -366,14 +366,27 @@ export function leaveQueue(name: string, member: QueueMember): QueueResult {
   });
 }
 
-/** Delete a queue and its waiters. Refused while someone holds it, unless `force`. */
+/**
+ * Delete a queue and its waiters. Refused while someone holds it, unless `force`.
+ * Sends `queue.deleted` naming the evicted holder and the dropped waiters.
+ */
 export function deleteQueue(name: string, force = false): QueueDeleteResult {
-  return transact(() => {
+  return transact((_at, events) => {
     const row = queueRow(name);
     if (!row) return { ok: false, reason: 'not_found' };
     const queue = view(row);
     if (queue.holder && !force) return { ok: false, reason: 'held', queue };
     db().prepare(`DELETE FROM queues WHERE name = ?`).run(name);
+    const ref = (m: { agent: string; thread_id: string | null }) => ({
+      agent: m.agent,
+      thread_id: m.thread_id,
+    });
+    events.push({
+      event: 'queue.deleted',
+      queue: name,
+      holder: queue.holder && ref(queue.holder),
+      waiters: queue.waiters.map(ref),
+    });
     return { ok: true, deleted: queue };
   });
 }
