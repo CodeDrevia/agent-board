@@ -560,7 +560,11 @@ export function createApiRouter(): Router {
     }
     if (!result.ok) {
       res.status(409).json({
-        error: 'task is not claimed by this agent',
+        error:
+          result.reason === 'not_claimed_by_you'
+            ? `task is claimed by ${result.task.claimed_by ?? 'nobody'}, not ${agent}`
+            : `task is ${result.task.status} and cannot be released`,
+        reason: result.reason,
         claimed_by: result.task.claimed_by,
         task: result.task,
       });

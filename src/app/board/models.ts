@@ -112,3 +112,31 @@ export const COLUMNS: readonly { status: TaskStatus; label: string }[] = [
 
 /** An agent is considered "online" if it has checked in within this window. */
 export const ONLINE_WINDOW_MS = 2 * 60 * 1000;
+
+/** A queue's current holder (mirrors `QueueHolder` in src/server/queues.ts). */
+export interface QueueHolder {
+  agent: string;
+  thread_id: string | null;
+  note: string | null;
+  since: number;
+  lease_expires_at: number;
+}
+
+/** One FIFO waiter; `position` 1 is next in line. */
+export interface QueueWaiter {
+  agent: string;
+  thread_id: string | null;
+  note: string | null;
+  position: number;
+  joined_at: number;
+}
+
+/** A named lease queue (mirrors `Queue` in src/server/queues.ts). */
+export interface Queue {
+  name: string;
+  lease_ms: number;
+  created_by: string | null;
+  created_at: number;
+  holder: QueueHolder | null;
+  waiters: QueueWaiter[];
+}

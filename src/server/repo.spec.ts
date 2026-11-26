@@ -456,8 +456,52 @@ describe('task lifecycle integrity', () => {
 
     const result = repo.releaseTask(task.id, 'bob');
 
-    expect(result.ok).toBe(false);
+    expect(result).toMatchObject({ ok: false, reason: 'not_claimed_by_you' });
     expect(repo.getTask(task.id)?.claimed_by).toBe('alice');
+  });
+
+  it.each(['claimed', 'in_progress', 'blocked'] as const)(
+    'lets the holder release a %s task back to todo',
+    (status) => {
+      const task = repo.createTask({ title: `release from ${status}` });
+      expect(repo.claimTask(task.id, 'alice').ok).toBe(true);
+      if (status === 'in_progress')
+        expect(repo.setStatus(task.id, 'in_progress', 'alice').ok).toBe(true);
+      if (status === 'blocked') {
+        expect(repo.setStatus(task.id, 'in_progress', 'alice').ok).toBe(true);
+        expect(repo.setStatus(task.id, 'blocked', 'alice').ok).toBe(true);
+      }
+
+      const result = repo.releaseTask(task.id, 'alice');
+
+      expect(result.ok).toBe(true);
+      expect(repo.getTask(task.id)).toMatchObject({
+        status: 'todo',
+        claimed_by: null,
+        claimed_at: null,
+      });
+      expect(
+        repo
+          .listActivity({ limit: 500 })
+          .some((a) => a.task_id === task.id && a.kind === 'released'),
+      ).toBe(true);
+    },
+  );
+
+  it('refuses to release an unclaimed task with wrong_status', () => {
+    const task = repo.createTask({ title: 'never claimed' });
+    expect(repo.releaseTask(task.id, 'alice')).toMatchObject({ ok: false, reason: 'wrong_status' });
+  });
+
+  it('refuses another agent releasing an in_progress task', () => {
+    const task = repo.createTask({ title: 'busy task' });
+    repo.claimTask(task.id, 'alice');
+    repo.setStatus(task.id, 'in_progress', 'alice');
+    expect(repo.releaseTask(task.id, 'bob')).toMatchObject({
+      ok: false,
+      reason: 'not_claimed_by_you',
+    });
+    expect(repo.getTask(task.id)).toMatchObject({ status: 'in_progress', claimed_by: 'alice' });
   });
 
   it('rejects invalid transitions and cross-owner status changes', () => {
@@ -662,9 +706,7 @@ describe('mcp tool search mode', () => {
 
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({ reason: 'unknown_tool' });
-    expect(
-      (result.structuredContent as { all_tools: string[] }).all_tools,
-    ).toContain('post_task');
+    expect((result.structuredContent as { all_tools: string[] }).all_tools).toContain('post_task');
 
     await client.close();
     await server.close();

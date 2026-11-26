@@ -18,6 +18,7 @@ import type {
   Channel,
   MailMessage,
   MessageThread,
+  Queue,
   Task,
   TaskStatus,
   UnreadCount,
@@ -150,6 +151,9 @@ export class BoardService {
     defaultValue: [],
   });
 
+  /** Lease queues (read-only in the web app). */
+  readonly queues = httpResource<Queue[]>(() => `/api/queues`, { defaultValue: [] });
+
   constructor() {
     if (this.isBrowser) {
       setInterval(() => this.reloadAll(), POLL_INTERVAL_MS);
@@ -168,6 +172,7 @@ export class BoardService {
     this.unreadCounts.reload();
     this.threads.reload();
     this.targets.reload();
+    this.queues.reload();
   }
 
   /** Create a new task, then refresh. */
