@@ -145,6 +145,40 @@ function migrate(db: DatabaseSyncType): void {
     );
   `);
   migrateBoardV1(db);
+  migrateQueues(db);
+}
+
+/**
+ * Shared-resource queues: one row per named lock, its current holder and lease,
+ * and the FIFO waiters (ordered by `id`). Additive only.
+ */
+function migrateQueues(db: DatabaseSyncType): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS queues (
+      name              TEXT PRIMARY KEY,
+      lease_ms          INTEGER NOT NULL,
+      created_by        TEXT,
+      created_at        INTEGER NOT NULL,
+      holder            TEXT,
+      holder_thread_id  TEXT,
+      holder_note       TEXT,
+      holder_lease_ms   INTEGER,
+      held_since        INTEGER,
+      lease_expires_at  INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS queue_waiters (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      queue_name  TEXT NOT NULL,
+      agent       TEXT NOT NULL,
+      thread_id   TEXT,
+      note        TEXT,
+      lease_ms    INTEGER,
+      joined_at   INTEGER NOT NULL,
+      UNIQUE (queue_name, agent),
+      FOREIGN KEY (queue_name) REFERENCES queues(name) ON DELETE CASCADE
+    );
+  `);
 }
 
 /** Add `column` to `table` unless an earlier run already did (SQLite has no IF NOT EXISTS). */

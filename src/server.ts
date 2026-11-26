@@ -8,6 +8,7 @@ import express from 'express';
 import { join } from 'node:path';
 import { createApiRouter } from './server/api';
 import { createMcpRouter } from './server/mcp';
+import { sweepQueues } from './server/queues';
 import {
   createAuthRouter,
   describeAuth,
@@ -89,6 +90,15 @@ if (isMainModule(import.meta.url) || process.env['pm_id']) {
     console.log(`Node Express server listening on http://localhost:${port}`);
     console.log(describeAuth());
   });
+
+  // Expired queue leases pass to the next waiter even when nobody calls the API.
+  setInterval(() => {
+    try {
+      sweepQueues();
+    } catch (error) {
+      console.error('queue sweep failed', error);
+    }
+  }, 15_000).unref();
 }
 
 /**

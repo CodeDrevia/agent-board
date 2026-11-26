@@ -61,6 +61,18 @@ import {
   type AgentKind,
   type TaskStatus,
 } from './repo';
+import {
+  createQueue,
+  getQueue,
+  joinQueue,
+  leaveQueue,
+  listQueues,
+  normaliseQueueName,
+  parseLeaseMs,
+  releaseQueue,
+  renewQueue,
+  type QueueResult,
+} from './queues';
 
 /** Valid task statuses accepted from clients. */
 const STATUSES: readonly TaskStatus[] = [
@@ -83,6 +95,23 @@ function isTruthy(raw: unknown): boolean {
 function parseId(raw: string): number | null {
   const id = Number(raw);
   return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/** Optional free-text field from a body: trimmed, capped, '' → undefined. */
+function optionalText(raw: unknown, max: number): string | undefined {
+  const text = typeof raw === 'string' ? raw.trim().slice(0, max) : '';
+  return text || undefined;
+}
+
+/** Map a queue operation's result to a response: 404 unknown queue, 409 not the holder. */
+function sendQueueResult(res: Response, result: QueueResult): void {
+  if (result.ok) {
+    res.json({ queue: result.queue, you: result.you });
+  } else if (result.reason === 'not_found') {
+    res.status(404).json({ error: 'queue not found' });
+  } else {
+    res.status(409).json({ error: 'not the queue holder', queue: result.queue, you: result.you });
+  }
 }
 
 /** Build the `/api` router with all board endpoints registered. */
@@ -118,6 +147,85 @@ export function createApiRouter(): Router {
   /** List all agents that have ever checked in. */
   api.get('/agents', (_req, res) => {
     res.json(listAgents());
+  });
+
+  // --- Shared-resource queues ------------------------------------------------
+
+  /** Every queue with its holder, lease expiry and waiters in order. */
+  api.get('/queues', (_req, res) => {
+    res.json(listQueues());
+  });
+
+  /** Create a queue: `{name, lease_ms?}`. Idempotent: 201 when new, 200 when it existed. */
+  api.post('/queues', (req: Request, res: Response) => {
+    const name = normaliseQueueName(req.body?.name);
+    if (!name) {
+      res.status(400).json({ error: 'name must be 1-64 letters, digits, ".", "_" or "-"' });
+      return;
+    }
+    const leaseMs = parseLeaseMs(req.body?.lease_ms);
+    if (leaseMs === 'invalid') {
+      res.status(400).json({ error: 'lease_ms must be a positive integer' });
+      return;
+    }
+    const result = createQueue({
+      name,
+      lease_ms: leaseMs,
+      created_by: actorFor(principal(res), req.body?.agent),
+    });
+    res.status(result.created ? 201 : 200).json(result);
+  });
+
+  api.get('/queues/:name', (req: Request, res: Response) => {
+    const name = normaliseQueueName(req.params['name']);
+    const queue = name ? getQueue(name) : undefined;
+    if (!queue) {
+      res.status(404).json({ error: 'queue not found' });
+      return;
+    }
+    res.json(queue);
+  });
+
+  /**
+   * `join` `{thread_id?, note?, lease_ms?}`, `renew` `{lease_ms?}`, `release`, `leave`.
+   * All act as `agent` (or the signed-in user) and answer `{queue, you}`.
+   */
+  api.post('/queues/:name/:action', (req: Request, res: Response) => {
+    const action = String(req.params['action']);
+    if (!['join', 'renew', 'release', 'leave'].includes(action)) {
+      res.status(404).json({ error: 'unknown queue action' });
+      return;
+    }
+    const name = normaliseQueueName(req.params['name']);
+    if (!name) {
+      res.status(404).json({ error: 'queue not found' });
+      return;
+    }
+    const agent = actorFor(principal(res), req.body?.agent);
+    if (!agent) {
+      res.status(400).json({ error: 'agent is required' });
+      return;
+    }
+    const leaseMs = parseLeaseMs(req.body?.lease_ms);
+    if (leaseMs === 'invalid') {
+      res.status(400).json({ error: 'lease_ms must be a positive integer' });
+      return;
+    }
+    const result =
+      action === 'join'
+        ? joinQueue({
+            name,
+            agent,
+            thread_id: optionalText(req.body?.thread_id, 200),
+            note: optionalText(req.body?.note, 500),
+            lease_ms: leaseMs,
+          })
+        : action === 'renew'
+          ? renewQueue(name, agent, leaseMs)
+          : action === 'release'
+            ? releaseQueue(name, agent)
+            : leaveQueue(name, agent);
+    sendQueueResult(res, result);
   });
 
   // --- Tasks ----------------------------------------------------------------

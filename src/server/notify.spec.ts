@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   buildPayload,
+  buildQueueGrantPayload,
   configFromEnv,
   dispatch,
+  dispatchQueueGranted,
   isSelfLoop,
   sign,
   type NotifyConfig,
@@ -44,6 +46,7 @@ function cfg(over: Partial<NotifyConfig> = {}): NotifyConfig {
     webhookSecret: '',
     discordToken: '',
     discordChannelId: '',
+    discordSkipTargets: configFromEnv({}).discordSkipTargets,
     boardUrl: 'https://board.bombatomica64.dev',
     timeoutMs: 50,
     retries: 2,
@@ -54,7 +57,8 @@ function cfg(over: Partial<NotifyConfig> = {}): NotifyConfig {
 
 function okFetch() {
   return vi.fn(
-    async (_url: string | URL | Request, _init?: RequestInit) => new Response('', { status: 204 }),
+    async (_url: string | URL | Request, _init?: RequestInit) =>
+      new Response(null, { status: 204 }),
   );
 }
 
@@ -115,7 +119,7 @@ describe('notify', () => {
     expect(f).not.toHaveBeenCalled();
   });
 
-  it('posts to Discord only for non-orchestrator new tasks, without mentions or embeds', async () => {
+  it('posts to Discord only for new tasks whose target is not skipped, without mentions or embeds', async () => {
     const c = cfg({ webhookUrls: [], discordToken: TOKEN, discordChannelId: '123' });
     const f = okFetch();
     await dispatch('task.created', task(), c, f as unknown as typeof fetch, () => {});
@@ -127,15 +131,56 @@ describe('notify', () => {
       flags: 4,
     });
     f.mockClear();
-    await dispatch(
-      'task.created',
-      task({ target: 'orchestrator' }),
-      c,
+    for (const target of ['orchestrator', ' Clashboard ', 'brain', 'side']) {
+      await dispatch('task.created', task({ target }), c, f as unknown as typeof fetch, () => {});
+    }
+    await dispatch('task.retargeted', task(), c, f as unknown as typeof fetch, () => {});
+    expect(f).not.toHaveBeenCalled();
+    await dispatch('task.created', task({ target: '' }), c, f as unknown as typeof fetch, () => {});
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the Discord skip list from the env, replacing the default', () => {
+    expect(configFromEnv({}).discordSkipTargets).toEqual([
+      'orchestrator',
+      'clashboard',
+      'brain',
+      'side',
+    ]);
+    expect(
+      configFromEnv({ AGENT_BOARD_DISCORD_SKIP_TARGETS: ' ChatGPT, ,lorenzo' }).discordSkipTargets,
+    ).toEqual(['chatgpt', 'lorenzo']);
+  });
+
+  it('sends queue.granted to the webhooks only, signed, with the documented payload', async () => {
+    const grant = {
+      queue: 'zen-browser',
+      agent: 'claude-1',
+      thread_id: 'mcp:t1',
+      lease_expires_at: 123,
+    };
+    expect(buildQueueGrantPayload(grant, 'https://board.bombatomica64.dev', 'd-2')).toEqual({
+      event: 'queue.granted',
+      delivery_id: 'd-2',
+      queue: { name: 'zen-browser' },
+      holder: { agent: 'claude-1', thread_id: 'mcp:t1' },
+      lease_expires_at: 123,
+      board_url: 'https://board.bombatomica64.dev',
+    });
+    const f = okFetch();
+    await dispatchQueueGranted(
+      grant,
+      cfg({ webhookSecret: 'k', discordToken: TOKEN, discordChannelId: '123' }),
       f as unknown as typeof fetch,
       () => {},
     );
-    await dispatch('task.retargeted', task(), c, f as unknown as typeof fetch, () => {});
-    expect(f).not.toHaveBeenCalled();
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(String(f.mock.calls[0][0])).toBe(SECRET_URL);
+    const init = f.mock.calls[0][1]!;
+    expect((init.headers as Record<string, string>)['x-board-signature']).toBe(
+      sign(init.body as string, 'k'),
+    );
+    expect(JSON.parse(init.body as string).event).toBe('queue.granted');
   });
 
   it('retries, then gives up, logging only hosts and never secrets', async () => {

@@ -46,6 +46,18 @@ import {
   type AgentKind,
   type TaskStatus,
 } from './repo';
+import {
+  createQueue,
+  joinQueue,
+  leaveQueue,
+  listQueues,
+  normaliseQueueName,
+  parseLeaseMs,
+  releaseQueue,
+  renewQueue,
+  MAX_LEASE_MS,
+  type QueueResult,
+} from './queues';
 
 const TASK_STATUSES = [
   'todo',
@@ -82,6 +94,45 @@ const priorityArg = () =>
         'low = -1, normal = 0 (default), high = 1, urgent = 2.',
     );
 const dueDateArg = () => z.string().describe('Due date as YYYY-MM-DD.');
+
+const queueArg = () =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .describe(
+      'Queue name, one per shared resource, e.g. "zen-browser", "deploy-drevia", "phone", "gpu-pc". ' +
+        'Case-insensitive; spaces become dashes.',
+    );
+const leaseArg = () =>
+  z
+    .number()
+    .int()
+    .positive()
+    .describe(
+      `Lease length in milliseconds, e.g. 600000 for 10 minutes; capped at ${MAX_LEASE_MS} (24 h). ` +
+        'When it runs out the queue passes to the next waiter.',
+    );
+
+/** Apply the REST lease rules (clamped to 1 s .. 24 h); zod has already checked it is a positive integer. */
+function clampLease(ms: number | undefined): number | undefined {
+  const lease = parseLeaseMs(ms);
+  return lease === 'invalid' ? undefined : lease;
+}
+
+/** Run a queue operation on a validated name and map its result to a tool response. */
+function queueTool(raw: string, op: (name: string) => QueueResult): ToolResponse {
+  const name = normaliseQueueName(raw);
+  if (!name) return toolError('Queue names are 1-64 letters, digits, ".", "_" or "-".');
+  const result = op(name);
+  if (result.ok) return toolResult({ queue: result.queue, you: result.you });
+  if (result.reason === 'not_found')
+    return toolError(`Queue "${name}" does not exist; create it with queue_create.`, {
+      reason: 'not_found',
+    });
+  return toolError(`You do not hold queue "${name}".`, result);
+}
 
 /** Deprecated argument names still accepted: old name -> canonical name. */
 const COMMON_ALIASES: Readonly<Record<string, string>> = { id: 'task_id', message: 'body' };
@@ -599,10 +650,109 @@ const BOARD_TOOLS: readonly BoardTool[] = [
         : toolError(`Channel #${channel_id} was not found.`, { reason: 'not_found' });
     },
   }),
+
+  defineTool({
+    name: 'list_queues',
+    description:
+      'List shared-resource queues (locks): who holds each one, when their lease expires, and who waits in which order.',
+    keywords: 'locks resources mutex waiting turn holder browser deploy phone gpu',
+    shape: {},
+    handler: () => toolResult({ queues: listQueues() }),
+  }),
+
+  defineTool({
+    name: 'queue_create',
+    description:
+      'Create a named queue for a shared resource. Safe to call when it already exists; lease_ms then replaces its default lease.',
+    keywords: 'new lock resource mutex',
+    shape: {
+      queue: queueArg(),
+      lease_ms: leaseArg()
+        .optional()
+        .describe(
+          'Default lease for holders of this queue, in ms (default 1800000 = 30 min, max 24 h).',
+        ),
+      agent: agentArg().optional().describe('Creator of the queue.'),
+    },
+    handler: ({ queue, lease_ms, agent }) => {
+      const name = normaliseQueueName(queue);
+      if (!name) return toolError('Queue names are 1-64 letters, digits, ".", "_" or "-".');
+      return toolResult(createQueue({ name, lease_ms: clampLease(lease_ms), created_by: agent }));
+    },
+  }),
+
+  defineTool({
+    name: 'queue_join',
+    description:
+      'Ask for a shared resource. If the queue is free you hold it at once (you.state = "holding"); otherwise you wait ' +
+      'in line (you.state = "waiting", you.position = 1 means next) and a queue.granted webhook fires when it is your turn. ' +
+      'Joining again only reports where you stand. Release it as soon as you are done.',
+    keywords: 'lock acquire wait turn reserve resource mutex enqueue',
+    shape: {
+      queue: queueArg(),
+      agent: agentArg(),
+      thread_id: z
+        .string()
+        .trim()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe(
+          'Your T3 thread id, so whoever gets the grant webhook can wake the right thread.',
+        ),
+      note: z
+        .string()
+        .trim()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe('What you need it for, e.g. "PR #12 visual check".'),
+      lease_ms: leaseArg()
+        .optional()
+        .describe("Lease for this hold, in ms; default is the queue's lease (max 24 h)."),
+    },
+    handler: ({ queue, agent, thread_id, note, lease_ms }) =>
+      queueTool(queue, (name) =>
+        joinQueue({ name, agent, thread_id, note, lease_ms: clampLease(lease_ms) }),
+      ),
+  }),
+
+  defineTool({
+    name: 'queue_renew',
+    description:
+      'Extend your lease on a queue you hold, counted from now. Fails if you do not hold it.',
+    keywords: 'extend lease keep lock heartbeat more time',
+    shape: {
+      queue: queueArg(),
+      agent: agentArg(),
+      lease_ms: leaseArg()
+        .optional()
+        .describe('New lease from now, in ms; default is the lease you were granted (max 24 h).'),
+    },
+    handler: ({ queue, agent, lease_ms }) =>
+      queueTool(queue, (name) => renewQueue(name, agent, clampLease(lease_ms))),
+  }),
+
+  defineTool({
+    name: 'queue_release',
+    description: 'Free a queue you hold so the next waiter gets it. Only the holder can release.',
+    keywords: 'unlock free done finished give back resource',
+    shape: { queue: queueArg(), agent: agentArg() },
+    handler: ({ queue, agent }) => queueTool(queue, (name) => releaseQueue(name, agent)),
+  }),
+
+  defineTool({
+    name: 'queue_leave',
+    description:
+      'Stop waiting for a queue. If you hold it, this releases it. Does nothing if you are not in it.',
+    keywords: 'cancel wait dequeue give up unlock',
+    shape: { queue: queueArg(), agent: agentArg() },
+    handler: ({ queue, agent }) => queueTool(queue, (name) => leaveQueue(name, agent)),
+  }),
 ];
 
 /** Tools whose optional `agent` still means "who is doing this" (creator). */
-const ACTOR_WHEN_OPTIONAL = new Set(['post_task', 'create_channel']);
+const ACTOR_WHEN_OPTIONAL = new Set(['post_task', 'create_channel', 'queue_create']);
 
 /** The argument names that carry the acting agent for one tool. */
 function actorKeys(tool: BoardTool): string[] {
@@ -688,6 +838,7 @@ const SEARCH_INSTRUCTIONS = [
   'call returns the tool JSON Schema so you can retry immediately.',
   `Available tools: ${TOOL_NAMES.join(', ')}.`,
   'Usual flow: list_tasks (filter by target to find work for you), claim_task, set_task_status, set_task_result, comment_task. Post work for others with post_task and a target.',
+  'For a shared resource (browser, deploy, phone, GPU PC): queue_join, then queue_release when done.',
   'Mail delivery is pull-based: nothing here can interrupt you, so run read_inbox at session',
   'start and after each meaningful work boundary, then acknowledge_message what you handled.',
 ].join(' ');

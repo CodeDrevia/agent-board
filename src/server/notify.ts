@@ -5,7 +5,10 @@
  * - generic webhooks (`AGENT_BOARD_WEBHOOK_URLS`, optional HMAC with
  *   `AGENT_BOARD_WEBHOOK_SECRET`);
  * - a Discord channel message through a bot (`AGENT_BOARD_DISCORD_BOT_TOKEN` +
- *   `AGENT_BOARD_DISCORD_CHANNEL_ID`) for new tasks not meant for the orchestrator.
+ *   `AGENT_BOARD_DISCORD_CHANNEL_ID`) for new tasks, except those whose target is
+ *   in `AGENT_BOARD_DISCORD_SKIP_TARGETS`.
+ *
+ * Queue grants (`queue.granted`) go to the webhooks only.
  *
  * Delivery is fire-and-forget: it never throws into, or delays, the request
  * that created the task. URLs and tokens may carry secrets, so logs name only
@@ -16,11 +19,23 @@ import type { Task } from './repo';
 
 export type TaskEventName = 'task.created' | 'task.retargeted';
 
+/** Targets whose new tasks never reach Discord unless the env says otherwise. */
+export const DEFAULT_DISCORD_SKIP_TARGETS = 'orchestrator,clashboard,brain,side';
+
+/** A queue handed to a waiter after a release, an expiry or the holder leaving. */
+export interface QueueGrant {
+  queue: string;
+  agent: string;
+  thread_id: string | null;
+  lease_expires_at: number;
+}
+
 export interface NotifyConfig {
   webhookUrls: string[];
   webhookSecret: string;
   discordToken: string;
   discordChannelId: string;
+  discordSkipTargets: string[];
   boardUrl: string;
   timeoutMs: number;
   retries: number;
@@ -39,6 +54,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): NotifyConfi
     webhookSecret: env['AGENT_BOARD_WEBHOOK_SECRET'] ?? '',
     discordToken: env['AGENT_BOARD_DISCORD_BOT_TOKEN'] ?? '',
     discordChannelId: (env['AGENT_BOARD_DISCORD_CHANNEL_ID'] ?? '').trim(),
+    discordSkipTargets: (env['AGENT_BOARD_DISCORD_SKIP_TARGETS'] ?? DEFAULT_DISCORD_SKIP_TARGETS)
+      .split(',')
+      .map(norm)
+      .filter(Boolean),
     boardUrl: (env['PUBLIC_BASE_URL'] || 'https://board.bombatomica64.dev').replace(/\/+$/, ''),
     timeoutMs: 5000,
     retries: 2,
@@ -73,6 +92,21 @@ export function buildPayload(
       priority: task.priority,
       due_date: task.due_date,
     },
+    board_url: boardUrl,
+  };
+}
+
+export function buildQueueGrantPayload(
+  grant: QueueGrant,
+  boardUrl: string,
+  deliveryId: string = randomUUID(),
+) {
+  return {
+    event: 'queue.granted' as const,
+    delivery_id: deliveryId,
+    queue: { name: grant.queue },
+    holder: { agent: grant.agent, thread_id: grant.thread_id },
+    lease_expires_at: grant.lease_expires_at,
     board_url: boardUrl,
   };
 }
@@ -123,6 +157,22 @@ async function deliver(
   return false;
 }
 
+/** One signed POST per configured webhook URL, all with the same body. */
+function webhookJobs(
+  payload: unknown,
+  cfg: NotifyConfig,
+  doFetch: Fetch,
+  log: Logger,
+): Promise<boolean>[] {
+  if (cfg.webhookUrls.length === 0) return [];
+  const body = JSON.stringify(payload);
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (cfg.webhookSecret) headers['x-board-signature'] = sign(body, cfg.webhookSecret);
+  return cfg.webhookUrls.map((url) =>
+    deliver(url, { headers, body }, `webhook ${hostOf(url)}`, cfg, doFetch, log),
+  );
+}
+
 /**
  * Send every configured notification for one event. Returns a promise for
  * tests; callers should not await it.
@@ -136,20 +186,12 @@ export async function dispatch(
 ): Promise<void> {
   try {
     if (isSelfLoop(task)) return;
-    const jobs: Promise<boolean>[] = [];
-    if (cfg.webhookUrls.length > 0) {
-      const body = JSON.stringify(buildPayload(event, task, cfg.boardUrl));
-      const headers: Record<string, string> = { 'content-type': 'application/json' };
-      if (cfg.webhookSecret) headers['x-board-signature'] = sign(body, cfg.webhookSecret);
-      for (const url of cfg.webhookUrls) {
-        jobs.push(deliver(url, { headers, body }, `webhook ${hostOf(url)}`, cfg, doFetch, log));
-      }
-    }
+    const jobs = webhookJobs(buildPayload(event, task, cfg.boardUrl), cfg, doFetch, log);
     if (
       event === 'task.created' &&
       cfg.discordToken &&
       cfg.discordChannelId &&
-      norm(task.target) !== 'orchestrator'
+      !cfg.discordSkipTargets.includes(norm(task.target))
     ) {
       const body = JSON.stringify({
         content: discordMessage(task, cfg.boardUrl),
@@ -177,6 +219,26 @@ export async function dispatch(
   } catch {
     log('notify: unexpected error while dispatching');
   }
+}
+
+/** Send `queue.granted` to every webhook. Returns a promise for tests. */
+export async function dispatchQueueGranted(
+  grant: QueueGrant,
+  cfg: NotifyConfig = configFromEnv(),
+  doFetch: Fetch = fetch,
+  log: Logger = (m) => console.warn(m),
+): Promise<void> {
+  try {
+    await Promise.all(webhookJobs(buildQueueGrantPayload(grant, cfg.boardUrl), cfg, doFetch, log));
+  } catch {
+    log('notify: unexpected error while dispatching');
+  }
+}
+
+/** Fire-and-forget entry point used by the queue layer. */
+export function notifyQueueGranted(grant: QueueGrant): void {
+  if (process.env['VITEST'] && !process.env['AGENT_BOARD_NOTIFY_IN_TESTS']) return;
+  void dispatchQueueGranted(grant).catch(() => undefined);
 }
 
 /** Fire-and-forget entry point used by the data layer. */
