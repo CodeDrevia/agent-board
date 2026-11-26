@@ -92,3 +92,4 @@ Use the CLI: `node /home/lollo/Playground/agent-board/bin/agentboard.mjs <cmd>`
 | Mark mail handled             | `agentboard ack <message-id>`                      |
 | Message someone / a channel   | `agentboard send <agent\|#channel> "…" [--thread T]` |
 | Find past messages            | `agentboard messages --q TEXT [--thread T] [--unread]` |
+| Wait for a shared resource    | `agentboard queue join <name> --thread T` … `agentboard queue release <name> --thread T` (needs `AGENT_BOARD_NAME`) |

@@ -11,7 +11,8 @@
  *   AGENT_BOARD_NAME  identity used for claims/posts (default: user@host)
  *   AGENT_BOARD_KIND  claude | codex | other (default: other)
  *
- * Exit codes: 0 success, 1 usage/other error, 2 claim conflict (already taken).
+ * Exit codes: 0 success, 1 usage/other error, 2 claim conflict (already taken)
+ * or queue conflict (you do not hold it).
  */
 import { hostname, userInfo } from 'node:os';
 
@@ -97,6 +98,46 @@ function printInbox(payload) {
   console.log(`\n${payload.pending} pending — acknowledge with: agentboard ack <message-id>`);
 }
 
+/** Render one queue: holder, lease left, then waiters in order. */
+function queueLines(q) {
+  const lines = [];
+  if (q.holder) {
+    const mins = Math.max(0, Math.round((q.holder.lease_expires_at - Date.now()) / 60000));
+    const note = q.holder.note ? ` — ${q.holder.note}` : '';
+    lines.push(`${q.name}: held by @${q.holder.agent} (${mins} min left)${note}`);
+  } else {
+    lines.push(`${q.name}: free`);
+  }
+  for (const w of q.waiters) {
+    lines.push(`  ${w.position}. @${w.agent}${w.note ? ` — ${w.note}` : ''}`);
+  }
+  return lines;
+}
+
+/** Print where this agent stands after a queue command. */
+function printQueueResult(body) {
+  const you = body.you;
+  if (you.state === 'holding') {
+    console.log(
+      `holding ${body.queue.name} until ${new Date(you.lease_expires_at).toLocaleTimeString()}`,
+    );
+  } else if (you.state === 'waiting') {
+    console.log(`waiting for ${body.queue.name}, position ${you.position}`);
+  } else {
+    console.log(`not in ${body.queue.name}`);
+  }
+}
+
+/** Lease flag in minutes → milliseconds for the API; a bad value exits instead of using the default. */
+function leaseMs(flags) {
+  if (flags['lease-min'] === undefined) return undefined;
+  const minutes = Number(flags['lease-min']);
+  if (typeof flags['lease-min'] !== 'string' || !Number.isFinite(minutes) || minutes <= 0) {
+    die(`--lease-min must be a positive number of minutes, got: ${flags['lease-min']}`);
+  }
+  return Math.round(minutes * 60000);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -128,6 +169,18 @@ Commands:
   activity [--repo R] [--limit N]           recent activity feed
   heartbeat                                 announce presence (refresh last-seen)
   repos                                     list known repos
+
+Shared-resource queues (locks: browser, deploys, phone, GPU PC):
+  queues                                    list queues, holders and waiters
+  queue create <name> [--lease-min N]       create a queue (idempotent)
+  queue join <name> [--note N] [--thread T] hold it now, or wait in line
+             [--lease-min N]
+  queue renew <name> [--lease-min N]        extend your lease from now
+  queue release <name>                      free it for the next waiter
+  queue leave <name>                        stop waiting (releases if holding)
+  queue delete <name> [--force]             delete it (--force even while held)
+  join/renew/release/leave need a name only you use: AGENT_BOARD_NAME or --agent A.
+  You are that name plus --thread T: pass the same --thread on every call.
 
 Mailbox (pull-based — nothing wakes an idle agent; poll at your own boundaries):
   inbox [--all] [--limit N] [--json]        read your pending messages
@@ -380,6 +433,73 @@ async function main() {
         return;
       }
       for (const row of body) console.log(`${String(row.unread).padStart(4)}  ${row.recipient}`);
+      return;
+    }
+
+    case 'queues': {
+      const { status, body } = await api('GET', '/api/queues');
+      if (status >= 400) die(`error: ${JSON.stringify(body)}`);
+      if (!Array.isArray(body) || body.length === 0) {
+        console.log('(no queues)');
+        return;
+      }
+      for (const q of body) for (const line of queueLines(q)) console.log(line);
+      return;
+    }
+
+    case 'queue': {
+      const [action, name] = positional;
+      const actions = ['create', 'join', 'renew', 'release', 'leave', 'delete'];
+      if (!actions.includes(action) || !name) {
+        die(`usage: agentboard queue <${actions.join('|')}> <name> [--lease-min N]`);
+      }
+      if (action === 'create') {
+        const { status, body } = await api('POST', '/api/queues', {
+          name,
+          lease_ms: leaseMs(flags),
+          agent: NAME,
+        });
+        if (status >= 400) die(`error: ${JSON.stringify(body)}`);
+        console.log(`${body.created ? 'created' : 'exists'}: ${queueLines(body.queue).join('\n')}`);
+        return;
+      }
+      if (action === 'delete') {
+        const force = flags.force ? '?force=true' : '';
+        const { status, body } = await api(
+          'DELETE',
+          `/api/queues/${encodeURIComponent(name)}${force}`,
+        );
+        if (status === 409)
+          die(`CONFLICT: ${name} is held by @${body.queue.holder.agent}; use --force`, 2);
+        if (status >= 400) die(`error: ${JSON.stringify(body)}`);
+        console.log(`deleted ${name}`);
+        return;
+      }
+      // The user@host default is shared by every agent on this machine: two of them
+      // would be one queue member, so a queue hold needs a name chosen on purpose.
+      const agent = flags.agent ? String(flags.agent) : process.env.AGENT_BOARD_NAME;
+      if (!agent)
+        die('queue commands need a name only you use: set AGENT_BOARD_NAME or pass --agent A');
+      const lease = leaseMs(flags);
+      if (action === 'join' && !flags.thread) {
+        console.error(
+          `warning: joining ${name} as ${agent} with no --thread: every session named ${agent} ` +
+            'without --thread is this same member and can renew or release your hold',
+        );
+      }
+      const { status, body } = await api(
+        'POST',
+        `/api/queues/${encodeURIComponent(name)}/${action}`,
+        {
+          agent,
+          lease_ms: lease,
+          note: flags.note ? String(flags.note) : undefined,
+          thread_id: flags.thread ? String(flags.thread) : undefined,
+        },
+      );
+      if (status === 409) die(`CONFLICT: you do not hold ${name}`, 2);
+      if (status >= 400) die(`error: ${JSON.stringify(body)}`);
+      printQueueResult(body);
       return;
     }
 

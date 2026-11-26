@@ -536,6 +536,16 @@ export function actorFor(p: Principal, requested?: unknown): string {
   return p.name;
 }
 
+/**
+ * `actorFor` without the fallback: a token or open caller must name itself, so
+ * callers that all share the token's name cannot pass for one another.
+ */
+export function explicitActorFor(p: Principal, requested?: unknown): string | null {
+  const asked = typeof requested === 'string' ? requested.trim() : '';
+  if (p.kind === 'token' || p.kind === 'open') return asked || null;
+  return p.name;
+}
+
 function writeMethod(method: string): boolean {
   return !['GET', 'HEAD', 'OPTIONS'].includes(method);
 }
