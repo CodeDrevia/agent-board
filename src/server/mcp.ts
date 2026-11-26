@@ -430,7 +430,7 @@ const BOARD_TOOLS: readonly BoardTool[] = [
 
   defineTool({
     name: 'release_task',
-    description: 'Release an agent-owned claim back to the shared task pool.',
+    description: 'Release your claimed, in_progress or blocked task back to the shared task pool (status todo).',
     keywords: 'give back unclaim abandon drop stop',
     shape: { task_id: taskIdArg(), agent: agentArg() },
     handler: ({ task_id, agent }) => {
@@ -440,7 +440,9 @@ const BOARD_TOOLS: readonly BoardTool[] = [
         : toolError(
             result.reason === 'not_found'
               ? `Task #${task_id} was not found.`
-              : `Task #${task_id} is not claimed by ${agent}.`,
+              : result.reason === 'not_claimed_by_you'
+                ? `Task #${task_id} is claimed by ${result.task.claimed_by ?? 'nobody'}, not ${agent}.`
+                : `Task #${task_id} is ${result.task.status}; only claimed, in_progress or blocked tasks can be released.`,
             result,
           );
     },

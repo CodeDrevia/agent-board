@@ -442,7 +442,11 @@ export type ClaimResult =
 export type ReleaseResult =
   | { ok: true; task: Task }
   | { ok: false; reason: 'not_found' }
-  | { ok: false; reason: 'conflict'; task: Task };
+  | { ok: false; reason: 'not_claimed_by_you'; task: Task }
+  | { ok: false; reason: 'wrong_status'; task: Task };
+
+/** States a claim holder may release back to `todo` (the owned states). */
+const RELEASABLE_STATES: readonly TaskStatus[] = ['claimed', 'in_progress', 'blocked'];
 
 export type StatusResult =
   | { ok: true; task: Task }
@@ -492,22 +496,28 @@ export function claimTask(id: number, agent: string): ClaimResult {
   return { ok: true, task };
 }
 
-/** Release a claim, returning the task to `todo`. */
+/**
+ * Release a claim, returning the task to `todo`. The claim holder may release from
+ * `claimed`, `in_progress` or `blocked`; the claim is cleared.
+ */
 export function releaseTask(id: number, agent: string): ReleaseResult {
   const ts = now();
+  const placeholders = RELEASABLE_STATES.map(() => '?').join(', ');
   const result = db()
     .prepare(
       `UPDATE tasks
          SET status = 'todo', claimed_by = NULL, claimed_at = NULL, updated_at = ?
-       WHERE id = ? AND status = 'claimed' AND claimed_by = ?`,
+       WHERE id = ? AND status IN (${placeholders}) AND claimed_by = ?`,
     )
-    .run(ts, id, agent);
+    .run(ts, id, ...RELEASABLE_STATES, agent);
   const task = getTask(id);
   if (!task) {
     return { ok: false, reason: 'not_found' };
   }
   if (result.changes === 0) {
-    return { ok: false, reason: 'conflict', task };
+    return RELEASABLE_STATES.includes(task.status) && task.claimed_by !== agent
+      ? { ok: false, reason: 'not_claimed_by_you', task }
+      : { ok: false, reason: 'wrong_status', task };
   }
   logActivity({ task_id: id, agent, repo: task.repo, kind: 'released' });
   return { ok: true, task };
