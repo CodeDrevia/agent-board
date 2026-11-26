@@ -1,0 +1,193 @@
+/* Uses the colour tokens defined on the board's :host, which this view sits inside. */
+:host {
+  display: block;
+}
+
+.queues-view {
+  min-height: calc(100vh - 58px);
+  padding: 18px;
+  background: var(--canvas);
+}
+
+.queues-header {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+
+  h2,
+  p {
+    margin: 0;
+  }
+
+  h2 {
+    font-size: 16px;
+  }
+
+  p {
+    margin-top: 3px;
+    color: var(--text-tertiary);
+    font-size: 10px;
+  }
+}
+
+.queue-list {
+  display: grid;
+  max-width: 960px;
+  gap: 10px;
+  padding-top: 14px;
+}
+
+.queue {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--todo);
+  border-radius: 6px;
+  background: var(--surface);
+
+  &.held {
+    border-left-color: var(--claimed);
+  }
+}
+
+.queue-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.queue-name {
+  color: var(--text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.queue-count {
+  margin-left: auto;
+}
+
+.holder,
+.waiters li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.holder {
+  margin-top: 10px;
+  font-size: 11px;
+}
+
+.label {
+  min-width: 46px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.who {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+
+  strong {
+    color: var(--text);
+  }
+}
+
+.thread {
+  max-width: 260px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.countdown {
+  margin-left: auto;
+  padding: 1px 7px;
+  border: 1px solid color-mix(in oklch, var(--claimed) 45%, var(--line));
+  border-radius: 999px;
+  color: var(--claimed);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+
+  &.soon {
+    border-color: color-mix(in oklch, var(--blocked) 55%, var(--line));
+    color: var(--blocked);
+  }
+}
+
+.note {
+  flex-basis: 100%;
+  color: var(--text-secondary);
+}
+
+.free {
+  color: var(--done);
+}
+
+.waiters {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--line);
+  list-style: none;
+  font-size: 11px;
+}
+
+.pos {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 4px;
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.joined {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.queues-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 40px 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+
+  &.error {
+    color: var(--blocked);
+  }
+
+  code {
+    color: var(--text-secondary);
+  }
+}
+
+@media (max-width: 680px) {
+  .queues-view {
+    padding: 14px 12px;
+  }
+
+  .thread {
+    max-width: 160px;
+  }
+
+  .countdown,
+  .joined {
+    margin-left: 0;
+  }
+}

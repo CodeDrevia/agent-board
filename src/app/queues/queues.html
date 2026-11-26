@@ -1,0 +1,81 @@
+<main class="queues-view" aria-label="Queues">
+  <header class="queues-header">
+    <h2>Queues</h2>
+    <p>
+      Lease queues for shared resources. Read-only; agents join and release through the CLI or MCP.
+    </p>
+  </header>
+
+  @if (loading()) {
+    <div class="queues-state" role="status">Loading queues…</div>
+  } @else if (error(); as message) {
+    <div class="queues-state error" role="alert">
+      <span>{{ message }}</span>
+      <button class="secondary" type="button" (click)="board.queues.reload()">Retry</button>
+    </div>
+  } @else {
+    <div class="queue-list">
+      @for (queue of queues(); track queue.name) {
+        <section class="queue" [class.held]="queue.holder">
+          <header class="queue-head">
+            <strong class="queue-name">{{ queue.name }}</strong>
+            <span class="queue-lease" title="Lease a new holder gets"
+              >lease {{ lease(queue.lease_ms) }}</span
+            >
+            <span class="queue-count">{{ queue.waiters.length }} waiting</span>
+          </header>
+
+          <div class="holder">
+            @if (queue.holder; as holder) {
+              <span class="label">Holder</span>
+              <span class="who">
+                <strong>{{ holder.agent }}</strong>
+                @if (holder.thread_id) {
+                  <span class="thread" [title]="holder.thread_id">{{ holder.thread_id }}</span>
+                }
+              </span>
+              <span
+                class="countdown"
+                [class.soon]="expiringSoon(holder.lease_expires_at)"
+                [title]="'Lease expires at ' + clock(holder.lease_expires_at)"
+                aria-live="off"
+              >
+                {{ countdown(holder.lease_expires_at) }}
+              </span>
+              @if (holder.note) {
+                <span class="note">{{ holder.note }}</span>
+              }
+            } @else {
+              <span class="label">Holder</span>
+              <span class="free">Free</span>
+            }
+          </div>
+
+          @if (queue.waiters.length) {
+            <ol class="waiters" aria-label="Waiters, next first">
+              @for (w of queue.waiters; track w.position) {
+                <li>
+                  <span class="pos">{{ w.position }}</span>
+                  <span class="who">
+                    <strong>{{ w.agent }}</strong>
+                    @if (w.thread_id) {
+                      <span class="thread" [title]="w.thread_id">{{ w.thread_id }}</span>
+                    }
+                  </span>
+                  <span class="joined" [title]="'Joined at ' + clock(w.joined_at)">
+                    joined {{ clock(w.joined_at) }} · {{ ago(w.joined_at) }}
+                  </span>
+                </li>
+              }
+            </ol>
+          }
+        </section>
+      } @empty {
+        <div class="queues-state">
+          No queues yet. An agent creates one with
+          <code>agentboard queue create &lt;name&gt;</code>.
+        </div>
+      }
+    </div>
+  }
+</main>

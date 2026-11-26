@@ -29,7 +29,7 @@
     >
       <span aria-hidden="true">↻</span>
     </button>
-    @if (!chatOpen()) {
+    @if (!chatOpen() && !queuesOpen()) {
       <button
         class="primary"
         type="button"
@@ -43,8 +43,8 @@
       <button
         type="button"
         (click)="showBoard()"
-        [class.active]="!chatOpen() && !archiveOpen()"
-        [attr.aria-pressed]="!chatOpen() && !archiveOpen()"
+        [class.active]="!chatOpen() && !archiveOpen() && !queuesOpen()"
+        [attr.aria-pressed]="!chatOpen() && !archiveOpen() && !queuesOpen()"
       >
         Board
       </button>
@@ -64,11 +64,19 @@
       >
         Archive
       </button>
+      <button
+        type="button"
+        (click)="showQueues()"
+        [class.active]="queuesOpen()"
+        [attr.aria-pressed]="queuesOpen()"
+      >
+        Queues
+      </button>
     </div>
   </div>
 </header>
 
-@if (!chatOpen()) {
+@if (!chatOpen() && !queuesOpen()) {
   <nav class="filter-bar" aria-label="Board filters">
     <label class="search-field">
       <span class="search-icon" aria-hidden="true">⌕</span>
@@ -190,6 +198,8 @@
 
 @if (chatOpen()) {
   <app-chat [identity]="identity()" />
+} @else if (queuesOpen()) {
+  <app-queues />
 } @else if (archiveOpen()) {
   <main class="archive-view">
     <header class="archive-header">

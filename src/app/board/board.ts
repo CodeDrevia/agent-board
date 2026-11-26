@@ -20,6 +20,7 @@ import { BoardService } from './board.service';
 import { Chat } from '../chat/chat/chat';
 import { SendButton } from '../send-button/send-button';
 import { LinkedText } from '../linked-text/linked-text';
+import { Queues } from '../queues/queues';
 import {
   COLUMNS,
   ONLINE_WINDOW_MS,
@@ -35,7 +36,7 @@ const IDENTITY_KEY = 'agent-board.identity';
 
 @Component({
   selector: 'app-board',
-  imports: [Chat, SendButton, LinkedText],
+  imports: [Chat, SendButton, LinkedText, Queues],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './board.html',
   styleUrl: './board.scss',
@@ -74,21 +75,32 @@ export class Board {
   protected readonly formOpen = signal(false);
   protected readonly archiveOpen = signal(false);
   protected readonly chatOpen = signal(false);
+  protected readonly queuesOpen = signal(false);
 
   protected showBoard(): void {
     this.chatOpen.set(false);
     this.archiveOpen.set(false);
+    this.queuesOpen.set(false);
   }
 
   protected showChat(): void {
     this.chatOpen.set(true);
     this.archiveOpen.set(false);
+    this.queuesOpen.set(false);
     this.formOpen.set(false);
   }
 
   protected showArchive(): void {
     this.chatOpen.set(false);
     this.archiveOpen.set(true);
+    this.queuesOpen.set(false);
+    this.formOpen.set(false);
+  }
+
+  protected showQueues(): void {
+    this.chatOpen.set(false);
+    this.archiveOpen.set(false);
+    this.queuesOpen.set(true);
     this.formOpen.set(false);
   }
 
