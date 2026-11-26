@@ -173,6 +173,9 @@ Shared-resource queues (locks: browser, deploys, phone, GPU PC):
   queue renew <name> [--lease-min N]        extend your lease from now
   queue release <name>                      free it for the next waiter
   queue leave <name>                        stop waiting (releases if holding)
+  queue delete <name> [--force]             delete it (--force even while held)
+  join/renew/release/leave need a name only you use: AGENT_BOARD_NAME or --agent A.
+  You are that name plus --thread T: pass the same --thread on every call.
 
 Mailbox (pull-based — nothing wakes an idle agent; poll at your own boundaries):
   inbox [--all] [--limit N] [--json]        read your pending messages
@@ -441,7 +444,7 @@ async function main() {
 
     case 'queue': {
       const [action, name] = positional;
-      const actions = ['create', 'join', 'renew', 'release', 'leave'];
+      const actions = ['create', 'join', 'renew', 'release', 'leave', 'delete'];
       if (!actions.includes(action) || !name) {
         die(`usage: agentboard queue <${actions.join('|')}> <name> [--lease-min N]`);
       }
@@ -455,11 +458,28 @@ async function main() {
         console.log(`${body.created ? 'created' : 'exists'}: ${queueLines(body.queue).join('\n')}`);
         return;
       }
+      if (action === 'delete') {
+        const force = flags.force ? '?force=true' : '';
+        const { status, body } = await api(
+          'DELETE',
+          `/api/queues/${encodeURIComponent(name)}${force}`,
+        );
+        if (status === 409)
+          die(`CONFLICT: ${name} is held by @${body.queue.holder.agent}; use --force`, 2);
+        if (status >= 400) die(`error: ${JSON.stringify(body)}`);
+        console.log(`deleted ${name}`);
+        return;
+      }
+      // The user@host default is shared by every agent on this machine: two of them
+      // would be one queue member, so a queue hold needs a name chosen on purpose.
+      const agent = flags.agent ? String(flags.agent) : process.env.AGENT_BOARD_NAME;
+      if (!agent)
+        die('queue commands need a name only you use: set AGENT_BOARD_NAME or pass --agent A');
       const { status, body } = await api(
         'POST',
         `/api/queues/${encodeURIComponent(name)}/${action}`,
         {
-          agent: NAME,
+          agent,
           lease_ms: leaseMs(flags),
           note: flags.note ? String(flags.note) : undefined,
           thread_id: flags.thread ? String(flags.thread) : undefined,

@@ -150,7 +150,8 @@ function migrate(db: DatabaseSyncType): void {
 
 /**
  * Shared-resource queues: one row per named lock, its current holder and lease,
- * and the FIFO waiters (ordered by `id`). Additive only.
+ * and the FIFO waiters (ordered by `id`), unique per agent name and thread_id.
+ * Additive only.
  */
 function migrateQueues(db: DatabaseSyncType): void {
   db.exec(`
@@ -175,9 +176,11 @@ function migrateQueues(db: DatabaseSyncType): void {
       note        TEXT,
       lease_ms    INTEGER,
       joined_at   INTEGER NOT NULL,
-      UNIQUE (queue_name, agent),
       FOREIGN KEY (queue_name) REFERENCES queues(name) ON DELETE CASCADE
     );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS queue_waiters_member
+      ON queue_waiters (queue_name, agent, IFNULL(thread_id, ''));
   `);
 }
 

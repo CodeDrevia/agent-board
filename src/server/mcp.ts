@@ -3,7 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
-import { actorFor, publicHostname, type Principal } from './auth';
+import { actorFor, explicitActorFor, publicHostname, type Principal } from './auth';
 import {
   cleanContentType,
   cleanFilename,
@@ -48,6 +48,7 @@ import {
 } from './repo';
 import {
   createQueue,
+  deleteQueue,
   joinQueue,
   leaveQueue,
   listQueues,
@@ -56,6 +57,7 @@ import {
   releaseQueue,
   renewQueue,
   MAX_LEASE_MS,
+  type QueueMember,
   type QueueResult,
 } from './queues';
 
@@ -121,8 +123,24 @@ function clampLease(ms: number | undefined): number | undefined {
   return lease === 'invalid' ? undefined : lease;
 }
 
+const queueThreadArg = () =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'Your T3 thread id. With agent it identifies you in the queue: the same agent name from ' +
+        'another thread is someone else. Pass the one you joined with on renew, release and leave.',
+    );
+
 /** Run a queue operation on a validated name and map its result to a tool response. */
-function queueTool(raw: string, op: (name: string) => QueueResult): ToolResponse {
+function queueTool(
+  raw: string,
+  member: QueueMember,
+  op: (name: string) => QueueResult,
+): ToolResponse {
   const name = normaliseQueueName(raw);
   if (!name) return toolError('Queue names are 1-64 letters, digits, ".", "_" or "-".');
   const result = op(name);
@@ -131,7 +149,11 @@ function queueTool(raw: string, op: (name: string) => QueueResult): ToolResponse
     return toolError(`Queue "${name}" does not exist; create it with queue_create.`, {
       reason: 'not_found',
     });
-  return toolError(`You do not hold queue "${name}".`, result);
+  const as = member.thread_id ? `${member.agent} in thread ${member.thread_id}` : member.agent;
+  return toolError(
+    `You (${as}) do not hold queue "${name}". Pass the agent and thread_id you joined with.`,
+    result,
+  );
 }
 
 /** Deprecated argument names still accepted: old name -> canonical name. */
@@ -686,20 +708,13 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description:
       'Ask for a shared resource. If the queue is free you hold it at once (you.state = "holding"); otherwise you wait ' +
       'in line (you.state = "waiting", you.position = 1 means next) and a queue.granted webhook fires when it is your turn. ' +
-      'Joining again only reports where you stand. Release it as soon as you are done.',
+      'If your lease runs out the queue passes on and queue.expired fires: for long jobs such as deploys, ask for a lease ' +
+      'longer than your slowest run and renew. Joining again only reports where you stand. Release it as soon as you are done.',
     keywords: 'lock acquire wait turn reserve resource mutex enqueue',
     shape: {
       queue: queueArg(),
       agent: agentArg(),
-      thread_id: z
-        .string()
-        .trim()
-        .min(1)
-        .max(200)
-        .optional()
-        .describe(
-          'Your T3 thread id, so whoever gets the grant webhook can wake the right thread.',
-        ),
+      thread_id: queueThreadArg(),
       note: z
         .string()
         .trim()
@@ -712,7 +727,7 @@ const BOARD_TOOLS: readonly BoardTool[] = [
         .describe("Lease for this hold, in ms; default is the queue's lease (max 24 h)."),
     },
     handler: ({ queue, agent, thread_id, note, lease_ms }) =>
-      queueTool(queue, (name) =>
+      queueTool(queue, { agent, thread_id }, (name) =>
         joinQueue({ name, agent, thread_id, note, lease_ms: clampLease(lease_ms) }),
       ),
   }),
@@ -725,20 +740,24 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     shape: {
       queue: queueArg(),
       agent: agentArg(),
+      thread_id: queueThreadArg(),
       lease_ms: leaseArg()
         .optional()
         .describe('New lease from now, in ms; default is the lease you were granted (max 24 h).'),
     },
-    handler: ({ queue, agent, lease_ms }) =>
-      queueTool(queue, (name) => renewQueue(name, agent, clampLease(lease_ms))),
+    handler: ({ queue, agent, thread_id, lease_ms }) =>
+      queueTool(queue, { agent, thread_id }, (name) =>
+        renewQueue(name, { agent, thread_id }, clampLease(lease_ms)),
+      ),
   }),
 
   defineTool({
     name: 'queue_release',
     description: 'Free a queue you hold so the next waiter gets it. Only the holder can release.',
     keywords: 'unlock free done finished give back resource',
-    shape: { queue: queueArg(), agent: agentArg() },
-    handler: ({ queue, agent }) => queueTool(queue, (name) => releaseQueue(name, agent)),
+    shape: { queue: queueArg(), agent: agentArg(), thread_id: queueThreadArg() },
+    handler: ({ queue, agent, thread_id }) =>
+      queueTool(queue, { agent, thread_id }, (name) => releaseQueue(name, { agent, thread_id })),
   }),
 
   defineTool({
@@ -746,10 +765,37 @@ const BOARD_TOOLS: readonly BoardTool[] = [
     description:
       'Stop waiting for a queue. If you hold it, this releases it. Does nothing if you are not in it.',
     keywords: 'cancel wait dequeue give up unlock',
-    shape: { queue: queueArg(), agent: agentArg() },
-    handler: ({ queue, agent }) => queueTool(queue, (name) => leaveQueue(name, agent)),
+    shape: { queue: queueArg(), agent: agentArg(), thread_id: queueThreadArg() },
+    handler: ({ queue, agent, thread_id }) =>
+      queueTool(queue, { agent, thread_id }, (name) => leaveQueue(name, { agent, thread_id })),
+  }),
+
+  defineTool({
+    name: 'queue_delete',
+    description:
+      'Delete a queue and drop its waiters. Refused while someone holds it unless force is true.',
+    keywords: 'remove lock resource mutex drop',
+    shape: {
+      queue: queueArg(),
+      force: z.boolean().optional().describe('Delete even while someone holds it.'),
+    },
+    handler: ({ queue, force }) => {
+      const name = normaliseQueueName(queue);
+      if (!name) return toolError('Queue names are 1-64 letters, digits, ".", "_" or "-".');
+      const result = deleteQueue(name, force ?? false);
+      if (result.ok) return toolResult({ deleted: result.deleted });
+      if (result.reason === 'not_found')
+        return toolError(`Queue "${name}" does not exist.`, { reason: 'not_found' });
+      return toolError(
+        `Queue "${name}" is held by ${result.queue.holder!.agent}; pass force: true to delete it anyway.`,
+        result,
+      );
+    },
   }),
 ];
+
+/** Queue tools never fall back to the token's name: every caller sharing it would be one member. */
+const EXPLICIT_ACTOR = new Set(['queue_join', 'queue_renew', 'queue_release', 'queue_leave']);
 
 /** Tools whose optional `agent` still means "who is doing this" (creator). */
 const ACTOR_WHEN_OPTIONAL = new Set(['post_task', 'create_channel', 'queue_create']);
@@ -771,7 +817,11 @@ function actorKeys(tool: BoardTool): string[] {
  */
 function withActor(tool: BoardTool, args: unknown, who: Principal): Record<string, unknown> {
   const out = normalizeArgs(tool, { ...((args as Record<string, unknown>) ?? {}) });
-  for (const key of actorKeys(tool)) out[key] = actorFor(who, out[key]);
+  for (const key of actorKeys(tool)) {
+    out[key] = EXPLICIT_ACTOR.has(tool.name)
+      ? (explicitActorFor(who, out[key]) ?? undefined)
+      : actorFor(who, out[key]);
+  }
   return out;
 }
 
@@ -781,7 +831,12 @@ function advertisedShape(tool: BoardTool, withAliases = false): z.ZodRawShape {
   for (const key of actorKeys(tool)) {
     shape[key] = (tool.shape[key] as z.ZodTypeAny)
       .optional()
-      .describe('Acting agent name. Ignored for signed-in users, who act as themselves.');
+      .describe(
+        EXPLICIT_ACTOR.has(tool.name)
+          ? 'Your agent name, required: a name only you use, not a shared default. ' +
+              'Ignored for signed-in users, who act as themselves.'
+          : 'Acting agent name. Ignored for signed-in users, who act as themselves.',
+      );
   }
   if (!withAliases) return shape;
   // Directly registered tools are validated by the SDK, which drops unknown
@@ -798,7 +853,15 @@ function advertisedShape(tool: BoardTool, withAliases = false): z.ZodRawShape {
 }
 
 async function runTool(tool: BoardTool, args: unknown, who: Principal): Promise<ToolResponse> {
-  const parsed = z.object(tool.shape).safeParse(withActor(tool, args, who));
+  const input = withActor(tool, args, who);
+  if (EXPLICIT_ACTOR.has(tool.name) && input['agent'] === undefined) {
+    return toolError(
+      `${tool.name} needs an explicit agent: a name only you use. Without it every caller ` +
+        'sharing the board token would be the same queue member.',
+      { reason: 'agent_required', tool: tool.name },
+    );
+  }
+  const parsed = z.object(tool.shape).safeParse(input);
   if (!parsed.success) {
     return toolError(
       `Invalid arguments for ${tool.name}: ${parsed.error.issues
@@ -838,7 +901,8 @@ const SEARCH_INSTRUCTIONS = [
   'call returns the tool JSON Schema so you can retry immediately.',
   `Available tools: ${TOOL_NAMES.join(', ')}.`,
   'Usual flow: list_tasks (filter by target to find work for you), claim_task, set_task_status, set_task_result, comment_task. Post work for others with post_task and a target.',
-  'For a shared resource (browser, deploy, phone, GPU PC): queue_join, then queue_release when done.',
+  'For a shared resource (browser, deploy, phone, GPU PC): queue_join with your own agent name and',
+  'thread_id, then queue_release with the same two when done.',
   'Mail delivery is pull-based: nothing here can interrupt you, so run read_inbox at session',
   'start and after each meaningful work boundary, then acknowledge_message what you handled.',
 ].join(' ');

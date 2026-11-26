@@ -5,10 +5,10 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   buildPayload,
-  buildQueueGrantPayload,
+  buildQueueEventPayload,
   configFromEnv,
   dispatch,
-  dispatchQueueGranted,
+  dispatchQueueEvent,
   isSelfLoop,
   sign,
   type NotifyConfig,
@@ -154,12 +154,13 @@ describe('notify', () => {
 
   it('sends queue.granted to the webhooks only, signed, with the documented payload', async () => {
     const grant = {
+      event: 'queue.granted' as const,
       queue: 'zen-browser',
       agent: 'claude-1',
       thread_id: 'mcp:t1',
       lease_expires_at: 123,
     };
-    expect(buildQueueGrantPayload(grant, 'https://board.bombatomica64.dev', 'd-2')).toEqual({
+    expect(buildQueueEventPayload(grant, 'https://board.bombatomica64.dev', 'd-2')).toEqual({
       event: 'queue.granted',
       delivery_id: 'd-2',
       queue: { name: 'zen-browser' },
@@ -168,7 +169,7 @@ describe('notify', () => {
       board_url: 'https://board.bombatomica64.dev',
     });
     const f = okFetch();
-    await dispatchQueueGranted(
+    await dispatchQueueEvent(
       grant,
       cfg({ webhookSecret: 'k', discordToken: TOKEN, discordChannelId: '123' }),
       f as unknown as typeof fetch,

@@ -9,7 +9,7 @@
  * board entirely through these endpoints; see `AGENTS.md` for the protocol.
  */
 import { Router, json, raw, type Request, type Response } from 'express';
-import { actorFor, principal } from './auth';
+import { actorFor, explicitActorFor, principal } from './auth';
 import {
   cleanContentType,
   cleanFilename,
@@ -63,6 +63,7 @@ import {
 } from './repo';
 import {
   createQueue,
+  deleteQueue,
   getQueue,
   joinQueue,
   leaveQueue,
@@ -186,9 +187,20 @@ export function createApiRouter(): Router {
     res.json(queue);
   });
 
+  /** Delete a queue and its waiters; 409 while someone holds it unless `?force=true`. */
+  api.delete('/queues/:name', (req: Request, res: Response) => {
+    const name = normaliseQueueName(req.params['name']);
+    const force = ['1', 'true'].includes(String(req.query['force'] ?? ''));
+    const result = name ? deleteQueue(name, force) : ({ ok: false, reason: 'not_found' } as const);
+    if (result.ok) res.json({ deleted: result.deleted });
+    else if (result.reason === 'not_found') res.status(404).json({ error: 'queue not found' });
+    else res.status(409).json({ error: 'queue is held; pass force=true', queue: result.queue });
+  });
+
   /**
-   * `join` `{thread_id?, note?, lease_ms?}`, `renew` `{lease_ms?}`, `release`, `leave`.
-   * All act as `agent` (or the signed-in user) and answer `{queue, you}`.
+   * `join` `{agent, thread_id?, note?, lease_ms?}`, `renew` `{agent, thread_id?, lease_ms?}`,
+   * `release`/`leave` `{agent, thread_id?}` → `{queue, you}`. You are `agent` plus `thread_id`:
+   * pass the thread_id you joined with. Signed-in users always act as themselves.
    */
   api.post('/queues/:name/:action', (req: Request, res: Response) => {
     const action = String(req.params['action']);
@@ -201,9 +213,11 @@ export function createApiRouter(): Router {
       res.status(404).json({ error: 'queue not found' });
       return;
     }
-    const agent = actorFor(principal(res), req.body?.agent);
+    const agent = explicitActorFor(principal(res), req.body?.agent);
     if (!agent) {
-      res.status(400).json({ error: 'agent is required' });
+      res.status(400).json({
+        error: "agent is required: name yourself, the token's default name is shared",
+      });
       return;
     }
     const leaseMs = parseLeaseMs(req.body?.lease_ms);
@@ -211,20 +225,20 @@ export function createApiRouter(): Router {
       res.status(400).json({ error: 'lease_ms must be a positive integer' });
       return;
     }
+    const member = { agent, thread_id: optionalText(req.body?.thread_id, 200) };
     const result =
       action === 'join'
         ? joinQueue({
             name,
-            agent,
-            thread_id: optionalText(req.body?.thread_id, 200),
+            ...member,
             note: optionalText(req.body?.note, 500),
             lease_ms: leaseMs,
           })
         : action === 'renew'
-          ? renewQueue(name, agent, leaseMs)
+          ? renewQueue(name, member, leaseMs)
           : action === 'release'
-            ? releaseQueue(name, agent)
-            : leaveQueue(name, agent);
+            ? releaseQueue(name, member)
+            : leaveQueue(name, member);
     sendQueueResult(res, result);
   });
 

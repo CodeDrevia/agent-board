@@ -8,7 +8,7 @@
  *   `AGENT_BOARD_DISCORD_CHANNEL_ID`) for new tasks, except those whose target is
  *   in `AGENT_BOARD_DISCORD_SKIP_TARGETS`.
  *
- * Queue grants (`queue.granted`) go to the webhooks only.
+ * Queue events (`queue.granted`, `queue.expired`) go to the webhooks only.
  *
  * Delivery is fire-and-forget: it never throws into, or delays, the request
  * that created the task. URLs and tokens may carry secrets, so logs name only
@@ -22,8 +22,13 @@ export type TaskEventName = 'task.created' | 'task.retargeted';
 /** Targets whose new tasks never reach Discord unless the env says otherwise. */
 export const DEFAULT_DISCORD_SKIP_TARGETS = 'orchestrator,clashboard,brain,side';
 
-/** A queue handed to a waiter after a release, an expiry or the holder leaving. */
-export interface QueueGrant {
+/**
+ * `queue.granted`: a waiter now holds the queue (after a release, an expiry or the
+ * holder leaving). `queue.expired`: the holder's lease ran out and they no longer
+ * hold it. `agent`/`thread_id` are the new holder for a grant, the old one for an expiry.
+ */
+export interface QueueEvent {
+  event: 'queue.granted' | 'queue.expired';
   queue: string;
   agent: string;
   thread_id: string | null;
@@ -96,17 +101,17 @@ export function buildPayload(
   };
 }
 
-export function buildQueueGrantPayload(
-  grant: QueueGrant,
+export function buildQueueEventPayload(
+  e: QueueEvent,
   boardUrl: string,
   deliveryId: string = randomUUID(),
 ) {
   return {
-    event: 'queue.granted' as const,
+    event: e.event,
     delivery_id: deliveryId,
-    queue: { name: grant.queue },
-    holder: { agent: grant.agent, thread_id: grant.thread_id },
-    lease_expires_at: grant.lease_expires_at,
+    queue: { name: e.queue },
+    holder: { agent: e.agent, thread_id: e.thread_id },
+    lease_expires_at: e.lease_expires_at,
     board_url: boardUrl,
   };
 }
@@ -221,24 +226,24 @@ export async function dispatch(
   }
 }
 
-/** Send `queue.granted` to every webhook. Returns a promise for tests. */
-export async function dispatchQueueGranted(
-  grant: QueueGrant,
+/** Send one queue event to every webhook. Returns a promise for tests. */
+export async function dispatchQueueEvent(
+  e: QueueEvent,
   cfg: NotifyConfig = configFromEnv(),
   doFetch: Fetch = fetch,
   log: Logger = (m) => console.warn(m),
 ): Promise<void> {
   try {
-    await Promise.all(webhookJobs(buildQueueGrantPayload(grant, cfg.boardUrl), cfg, doFetch, log));
+    await Promise.all(webhookJobs(buildQueueEventPayload(e, cfg.boardUrl), cfg, doFetch, log));
   } catch {
     log('notify: unexpected error while dispatching');
   }
 }
 
 /** Fire-and-forget entry point used by the queue layer. */
-export function notifyQueueGranted(grant: QueueGrant): void {
+export function notifyQueueEvent(e: QueueEvent): void {
   if (process.env['VITEST'] && !process.env['AGENT_BOARD_NOTIFY_IN_TESTS']) return;
-  void dispatchQueueGranted(grant).catch(() => undefined);
+  void dispatchQueueEvent(e).catch(() => undefined);
 }
 
 /** Fire-and-forget entry point used by the data layer. */

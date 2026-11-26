@@ -3,12 +3,15 @@
  * slot, a phone). One holder at a time, on a lease; everyone else waits in FIFO
  * order and is granted the queue as soon as it frees.
  *
+ * A member is an agent name plus its thread_id: the same name from another
+ * thread (or with no thread) is someone else and waits its turn.
+ *
  * Every operation runs in one IMMEDIATE transaction that first frees expired
  * leases, so no decision is made on a lease that should already have ended.
- * Grant webhooks go out only after that transaction commits.
+ * Queue webhooks go out only after that transaction commits.
  */
 import { db, now } from './db';
-import { notifyQueueGranted, type QueueGrant } from './notify';
+import { notifyQueueEvent, type QueueEvent } from './notify';
 
 export const DEFAULT_LEASE_MS = 30 * 60_000;
 export const MAX_LEASE_MS = 24 * 60 * 60_000;
@@ -51,6 +54,17 @@ export type QueueResult =
   | { ok: true; queue: Queue; you: QueueMembership }
   | { ok: false; reason: 'not_found' }
   | { ok: false; reason: 'not_holder'; queue: Queue; you: QueueMembership };
+
+export type QueueDeleteResult =
+  | { ok: true; deleted: Queue }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'held'; queue: Queue };
+
+/** Who is acting: the agent name and, when it has one, its thread. */
+export interface QueueMember {
+  agent: string;
+  thread_id?: string | null;
+}
 
 interface QueueRow {
   name: string;
@@ -131,10 +145,21 @@ function view(row: QueueRow): Queue {
   };
 }
 
-function membershipOf(queue: Queue, agent: string): QueueMembership {
-  if (queue.holder?.agent === agent)
-    return { state: 'holding', lease_expires_at: queue.holder.lease_expires_at };
-  const waiter = queue.waiters.find((w) => w.agent === agent);
+function isMember(
+  entry: { agent: string; thread_id: string | null } | null,
+  member: QueueMember,
+): boolean {
+  return entry?.agent === member.agent && entry.thread_id === (member.thread_id ?? null);
+}
+
+function holderOf(row: QueueRow): { agent: string; thread_id: string | null } | null {
+  return row.holder === null ? null : { agent: row.holder, thread_id: row.holder_thread_id };
+}
+
+function membershipOf(queue: Queue, member: QueueMember): QueueMembership {
+  if (isMember(queue.holder, member))
+    return { state: 'holding', lease_expires_at: queue.holder!.lease_expires_at };
+  const waiter = queue.waiters.find((w) => isMember(w, member));
   return waiter ? { state: 'waiting', position: waiter.position } : { state: 'none' };
 }
 
@@ -156,7 +181,7 @@ function setHolder(
 }
 
 /** Free the queue and hand it to the first waiter, if any. */
-function grantNext(row: QueueRow, at: number, grants: QueueGrant[]): void {
+function grantNext(row: QueueRow, at: number, events: QueueEvent[]): void {
   const next = db()
     .prepare(`SELECT * FROM queue_waiters WHERE queue_name = ? ORDER BY id LIMIT 1`)
     .get(row.name) as unknown as WaiterRow | undefined;
@@ -177,7 +202,8 @@ function grantNext(row: QueueRow, at: number, grants: QueueGrant[]): void {
     { ...next, lease_ms: next.lease_ms ?? row.lease_ms },
     at,
   );
-  grants.push({
+  events.push({
+    event: 'queue.granted',
     queue: row.name,
     agent: next.agent,
     thread_id: next.thread_id,
@@ -185,48 +211,57 @@ function grantNext(row: QueueRow, at: number, grants: QueueGrant[]): void {
   });
 }
 
-function expireLeases(at: number, grants: QueueGrant[]): number {
+function expireLeases(at: number, events: QueueEvent[]): number {
   const expired = db()
     .prepare(`SELECT * FROM queues WHERE holder IS NOT NULL AND lease_expires_at <= ?`)
     .all(at) as unknown as QueueRow[];
-  for (const row of expired) grantNext(row, at, grants);
+  for (const row of expired) {
+    events.push({
+      event: 'queue.expired',
+      queue: row.name,
+      agent: row.holder!,
+      thread_id: row.holder_thread_id,
+      lease_expires_at: row.lease_expires_at!,
+    });
+    grantNext(row, at, events);
+  }
   return expired.length;
 }
 
 /**
  * Run `fn` in one IMMEDIATE transaction after freeing expired leases, then send
- * the grant webhooks once it has committed.
+ * the queue webhooks once it has committed.
  */
-function transact<T>(fn: (at: number, grants: QueueGrant[], expired: number) => T): T {
+function transact<T>(fn: (at: number, events: QueueEvent[], expired: number) => T): T {
   const d = db();
-  const grants: QueueGrant[] = [];
+  const events: QueueEvent[] = [];
   const at = now();
   d.exec('BEGIN IMMEDIATE');
   let out: T;
   try {
-    const expired = expireLeases(at, grants);
-    out = fn(at, grants, expired);
+    const expired = expireLeases(at, events);
+    out = fn(at, events, expired);
     d.exec('COMMIT');
   } catch (error) {
     d.exec('ROLLBACK');
     throw error;
   }
-  for (const grant of grants) notifyQueueGranted(grant);
+  for (const e of events) notifyQueueEvent(e);
   return out;
 }
 
 /** Shared shape of the holder/waiter operations: unknown queue → not_found. */
 function onQueue(
   name: string,
-  agent: string,
-  fn: (row: QueueRow, at: number, grants: QueueGrant[]) => 'ok' | 'not_holder',
+  member: QueueMember,
+  fn: (row: QueueRow, at: number, events: QueueEvent[]) => 'ok' | 'not_holder',
 ): QueueResult {
-  return transact((at, grants) => {
+  return transact((at, events) => {
     const row = queueRow(name);
     if (!row) return { ok: false, reason: 'not_found' };
-    const outcome = fn(row, at, grants);
+    const outcome = fn(row, at, events);
     const queue = view(queueRow(name)!);
-    const you = membershipOf(queue, agent);
+    const you = membershipOf(queue, member);
     return outcome === 'ok'
       ? { ok: true, queue, you }
       : { ok: false, reason: 'not_holder', queue, you };
@@ -270,44 +305,38 @@ export function getQueue(name: string): Queue | undefined {
  * Take the queue when it is free, otherwise wait at the back of the line.
  * Joining again while holding or waiting changes nothing and reports where you stand.
  */
-export function joinQueue(input: {
-  name: string;
-  agent: string;
-  thread_id?: string;
-  note?: string;
-  lease_ms?: number;
-}): QueueResult {
-  return onQueue(input.name, input.agent, (row, at) => {
+export function joinQueue(
+  input: QueueMember & { name: string; note?: string; lease_ms?: number },
+): QueueResult {
+  const member = { agent: input.agent, thread_id: input.thread_id ?? null };
+  return onQueue(input.name, member, (row, at) => {
     const known =
-      row.holder === input.agent ||
+      isMember(holderOf(row), member) ||
       db()
-        .prepare(`SELECT 1 FROM queue_waiters WHERE queue_name = ? AND agent = ?`)
-        .get(row.name, input.agent) !== undefined;
+        .prepare(
+          `SELECT 1 FROM queue_waiters WHERE queue_name = ? AND agent = ? AND thread_id IS ?`,
+        )
+        .get(row.name, member.agent, member.thread_id) !== undefined;
     if (known) return 'ok';
-    const thread_id = input.thread_id ?? null;
     const note = input.note ?? null;
     if (row.holder === null) {
-      setHolder(
-        row.name,
-        { agent: input.agent, thread_id, note, lease_ms: input.lease_ms ?? row.lease_ms },
-        at,
-      );
+      setHolder(row.name, { ...member, note, lease_ms: input.lease_ms ?? row.lease_ms }, at);
     } else {
       db()
         .prepare(
           `INSERT INTO queue_waiters (queue_name, agent, thread_id, note, lease_ms, joined_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(row.name, input.agent, thread_id, note, input.lease_ms ?? null, at);
+        .run(row.name, member.agent, member.thread_id, note, input.lease_ms ?? null, at);
     }
     return 'ok';
   });
 }
 
 /** Extend the holder's lease from now, by `lease_ms` or the lease they were granted. */
-export function renewQueue(name: string, agent: string, leaseMs?: number): QueueResult {
-  return onQueue(name, agent, (row, at) => {
-    if (row.holder !== agent) return 'not_holder';
+export function renewQueue(name: string, member: QueueMember, leaseMs?: number): QueueResult {
+  return onQueue(name, member, (row, at) => {
+    if (!isMember(holderOf(row), member)) return 'not_holder';
     const lease = leaseMs ?? row.holder_lease_ms ?? row.lease_ms;
     db()
       .prepare(`UPDATE queues SET holder_lease_ms = ?, lease_expires_at = ? WHERE name = ?`)
@@ -317,21 +346,35 @@ export function renewQueue(name: string, agent: string, leaseMs?: number): Queue
 }
 
 /** Free the queue (holder only) and grant the next waiter. */
-export function releaseQueue(name: string, agent: string): QueueResult {
-  return onQueue(name, agent, (row, at, grants) => {
-    if (row.holder !== agent) return 'not_holder';
-    grantNext(row, at, grants);
+export function releaseQueue(name: string, member: QueueMember): QueueResult {
+  return onQueue(name, member, (row, at, events) => {
+    if (!isMember(holderOf(row), member)) return 'not_holder';
+    grantNext(row, at, events);
     return 'ok';
   });
 }
 
 /** Stop waiting; a holder leaving frees the queue like a release. Not in it: no-op. */
-export function leaveQueue(name: string, agent: string): QueueResult {
-  return onQueue(name, agent, (row, at, grants) => {
-    if (row.holder === agent) grantNext(row, at, grants);
+export function leaveQueue(name: string, member: QueueMember): QueueResult {
+  return onQueue(name, member, (row, at, events) => {
+    if (isMember(holderOf(row), member)) grantNext(row, at, events);
     else
-      db().prepare(`DELETE FROM queue_waiters WHERE queue_name = ? AND agent = ?`).run(name, agent);
+      db()
+        .prepare(`DELETE FROM queue_waiters WHERE queue_name = ? AND agent = ? AND thread_id IS ?`)
+        .run(name, member.agent, member.thread_id ?? null);
     return 'ok';
+  });
+}
+
+/** Delete a queue and its waiters. Refused while someone holds it, unless `force`. */
+export function deleteQueue(name: string, force = false): QueueDeleteResult {
+  return transact(() => {
+    const row = queueRow(name);
+    if (!row) return { ok: false, reason: 'not_found' };
+    const queue = view(row);
+    if (queue.holder && !force) return { ok: false, reason: 'held', queue };
+    db().prepare(`DELETE FROM queues WHERE name = ?`).run(name);
+    return { ok: true, deleted: queue };
   });
 }
 
@@ -344,5 +387,5 @@ export function sweepQueues(): number {
     .prepare(`SELECT 1 FROM queues WHERE holder IS NOT NULL AND lease_expires_at <= ? LIMIT 1`)
     .get(now());
   if (!due) return 0;
-  return transact((_at, _grants, expired) => expired);
+  return transact((_at, _events, expired) => expired);
 }
